@@ -1,1 +1,477 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique goal IDs\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        MotivationState,        # Output: Robot's dominant goal and drive level\n        CognitiveDirective,     # Input: Directives to adjust motivation or set goals\n        EmotionState,           # Input: Robot's emotional state (influences motivation)\n        PerformanceReport,      # Input: Overall system performance (success/failure impacts motivation)\n        WorldModelState,        # Input: Current state of the world (opportunities, obstacles)\n        MemoryResponse,         # Input: Retrieved past goals, values, success metrics\n        InternalNarrative,      # Input: Robot's internal thoughts (self-assessment of progress)\n        SocialCognitionState,   # Input: Inferred user mood/intent (user's goals)\n        PredictionState         # Input: Predicted outcomes (impact on goal desirability)\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Experience Motivation Node.\")\n    MotivationState = String\n    CognitiveDirective = String\n    EmotionState = String\n    PerformanceReport = String\n    WorldModelState = String\n    MemoryResponse = String\n    InternalNarrative = String\n    SocialCognitionState = String\n    PredictionState = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'experience_motivation_node': {\n                'motivation_update_interval': 1.0, # How often to re-evaluate motivation\n                'llm_motivation_threshold_salience': 0.6, # Cumulative salience to trigger LLM\n                'recent_context_window_s': 15.0 # Window for deques for LLM context\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 30.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass ExperienceMotivationNode:\n    def __init__(self):\n        rospy.init_node('experience_motivation_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"motivation_log.db\")\n        self.motivation_update_interval = self.params.get('motivation_update_interval', 1.0) # How often to re-evaluate motivation\n        self.llm_motivation_threshold_salience = self.params.get('llm_motivation_threshold_salience', 0.6) # Cumulative salience to trigger LLM\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 15.0) # Window for deques for LLM context\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 30.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'motivation_log' table if it doesn't exist.\n        # NEW: Added 'llm_reasoning', 'context_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS motivation_log (\n                id TEXT PRIMARY KEY,            -- Unique motivation update ID (UUID)\n                timestamp TEXT,\n                dominant_goal_id TEXT,          -- ID of the currently dominant goal\n                overall_drive_level REAL,       -- Overall intensity of motivation (0.0 to 1.0)\n                active_goals_json TEXT,         -- JSON array of all active goals and their states\n                llm_reasoning TEXT,             -- NEW: LLM's detailed reasoning for motivation state\n                context_snapshot_json TEXT      -- NEW: JSON of relevant cognitive context at time of update\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_motivation_timestamp ON motivation_log (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.current_motivation_state = {\n            'timestamp': str(rospy.get_time()),\n            'dominant_goal_id': 'explore_environment', # Default passive goal\n            'overall_drive_level': 0.1,\n            'active_goals': [{'goal_id': 'explore_environment', 'priority': 0.1, 'status': 'active'}]\n        }\n\n        # Deques to maintain a short history of inputs relevant to motivation\n        self.recent_cognitive_directives = deque(maxlen=5) # Directives to set goals or adjust motivation\n        self.recent_emotion_states = deque(maxlen=5) # Emotions influence drive/goal preference\n        self.recent_performance_reports = deque(maxlen=5) # Success/failure impacts motivation\n        self.recent_world_model_states = deque(maxlen=5) # Opportunities, obstacles in environment\n        self.recent_memory_responses = deque(maxlen=5) # Past goals, values, learned success metrics\n        self.recent_internal_narratives = deque(maxlen=5) # Self-assessment of progress, desire\n        self.recent_social_cognition_states = deque(maxlen=5) # User's expressed goals/needs\n        self.recent_prediction_states = deque(maxlen=5) # Predicted outcomes for goal desirability\n\n        self.cumulative_motivation_salience = 0.0 # Aggregated salience to trigger LLM analysis\n\n        # --- Publishers ---\n        self.pub_motivation_state = rospy.Publisher('/motivation_state', MotivationState, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # For requesting actions to achieve goals\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n        rospy.Subscriber('/emotion_state', EmotionState, self.emotion_state_callback)\n        rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)\n        rospy.Subscriber('/world_model_state', String, self.world_model_state_callback) # Stringified JSON\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n        rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback) # Stringified JSON\n        rospy.Subscriber('/social_cognition_state', String, self.social_cognition_state_callback) # Stringified JSON\n        rospy.Subscriber('/prediction_state', String, self.prediction_state_callback) # Stringified JSON\n\n\n        # --- Timer for periodic motivation analysis ---\n        rospy.Timer(rospy.Duration(self.motivation_update_interval), self._run_motivation_analysis_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's experience motivation system online.\")\n        # Publish initial state\n        self.publish_motivation_state(None)\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_motivation_analysis_wrapper(self, event):\n        \"\"\"Wrapper to run the async motivation analysis from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM motivation analysis task already active. Skipping new cycle.\")\n            return\n        \n        # Schedule the async task\n        self.active_llm_task = asyncio.run_coroutine_threadsafe(\n            self.analyze_motivation_async(event), self._async_loop\n        )\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.5, max_tokens=300):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response. Moderate temperature for goal-setting nuance.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Moderate temperature for goal-setting nuance\n            \"max_tokens\": max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0]['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM analysis.\"\"\"\n        self.cumulative_motivation_salience += score\n        self.cumulative_motivation_salience = min(1.0, self.cumulative_motivation_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_cognitive_directives, self.recent_emotion_states,\n            self.recent_performance_reports, self.recent_world_model_states,\n            self.recent_memory_responses, self.recent_internal_narratives,\n            self.recent_social_cognition_states, self.recent_prediction_states\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name:\n            self.recent_cognitive_directives.append(data) # Add directives for self to context\n            # Directives to set new goals or adjust motivation are highly salient\n            if data.get('directive_type') in ['SetGoal', 'AdjustMotivation']:\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)\n            rospy.loginfo(f\"{self.node_name}: Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}).\")\n        else:\n            self.recent_cognitive_directives.append(data) # Add all directives for general context\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    def emotion_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'mood': ('neutral', 'mood'),\n            'sentiment_score': (0.0, 'sentiment_score'), 'mood_intensity': (0.0, 'mood_intensity')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_emotion_states.append(data)\n        # Strong emotions can influence motivation (e.g., frustration leading to change goal, happiness reinforcing current goal)\n        if data.get('mood_intensity', 0.0) > 0.5:\n            self._update_cumulative_salience(data.get('mood_intensity', 0.0) * 0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Emotion State. Mood: {data.get('mood', 'N/A')}.\")\n\n    def performance_report_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),\n            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('kpis_json'), str):\n            try: data['kpis'] = json.loads(data['kpis_json'])\n            except json.JSONDecodeError: data['kpis'] = {}\n        self.recent_performance_reports.append(data)\n        # Suboptimal performance can decrease motivation for current goal, high performance can increase\n        if data.get('suboptimal_flag', False) or data.get('overall_score', 1.0) < 0.7:\n            self._update_cumulative_salience(0.5) # Need to re-evaluate if not doing well\n        elif data.get('overall_score', 0.0) > 0.9:\n            self._update_cumulative_salience(0.2) # Reinforce success\n        rospy.logdebug(f\"{self.node_name}: Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}.\")\n\n    def world_model_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),\n            'changed_entities_json': ('[]', 'changed_entities_json'),\n            'significant_change_flag': (False, 'significant_change_flag'),\n            'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('changed_entities_json'), str):\n            try: data['changed_entities'] = json.loads(data['changed_entities_json'])\n            except json.JSONDecodeError: data['changed_entities'] = []\n        self.recent_world_model_states.append(data)\n        # Changes in world model can present new opportunities or obstacles to current goals\n        if data.get('significant_change_flag', False):\n            self._update_cumulative_salience(0.4)\n        rospy.logdebug(f\"{self.node_name}: Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Recalled past goals, values, or success/failure precedents influence motivation\n        if data.get('response_code', 0) == 200 and \\\n           any('goal_record' in mem.get('category', '') or 'value' in mem.get('category', '') for mem in data['memories']):\n            self._update_cumulative_salience(0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def internal_narrative_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'narrative_text': ('', 'narrative_text'),\n            'main_theme': ('', 'main_theme'), 'sentiment': (0.0, 'sentiment'), 'salience_score': (0.0, 'salience_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_internal_narratives.append(data)\n        # Narratives about progress, difficulty, desire for change, or commitment to goals\n        if \"goal\" in data.get('main_theme', '').lower() or \"progress\" in data.get('main_theme', '').lower():\n            self._update_cumulative_salience(data.get('salience_score', 0.0) * 0.4)\n        rospy.logdebug(f\"{self.node_name}: Received Internal Narrative (Theme: {data.get('main_theme', 'N/A')}).\")\n\n    def social_cognition_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'inferred_mood': ('neutral', 'inferred_mood'),\n            'mood_confidence': (0.0, 'mood_confidence'), 'inferred_intent': ('none', 'inferred_intent'),\n            'intent_confidence': (0.0, 'intent_confidence'), 'user_id': ('unknown', 'user_id')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_social_cognition_states.append(data)\n        # User's inferred intent (e.g., a direct command, a need for help) can set/influence robot's goals\n        if data.get('inferred_intent') in ['command', 'request_help'] and data.get('intent_confidence', 0.0) > 0.7:\n            self._update_cumulative_salience(data.get('intent_confidence', 0.0) * 0.8)\n        rospy.logdebug(f\"{self.node_name}: Received Social Cognition State. Intent: {data.get('inferred_intent', 'N/A')}.\")\n\n    def prediction_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'predicted_event': ('', 'predicted_event'),\n            'prediction_confidence': (0.0, 'prediction_confidence'), 'prediction_accuracy': (0.0, 'prediction_accuracy'),\n            'urgency_flag': (False, 'urgency_flag')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_prediction_states.append(data)\n        # Predictions of success/failure, or new opportunities/threats, influence goal desirability\n        if data.get('urgency_flag', False) or (data.get('prediction_confidence', 0.0) > 0.7 and 'success' in data.get('predicted_event', '').lower()):\n            self._update_cumulative_salience(0.6) # High confidence predictions influence\n        rospy.logdebug(f\"{self.node_name}: Received Prediction State. Event: {data.get('predicted_event', 'N/A')}.\")\n\n    # --- Core Motivation Analysis Logic (Async with LLM) ---\n    async def analyze_motivation_async(self, event):\n        \"\"\"\n        Asynchronously analyzes recent cognitive states to infer and update the robot's\n        dominant goal and overall drive level, using LLM for nuanced motivation adjustments.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        dominant_goal_id = self.current_motivation_state.get('dominant_goal_id')\n        overall_drive_level = self.current_motivation_state.get('overall_drive_level')\n        active_goals = self.current_motivation_state.get('active_goals', [])\n        \n        llm_reasoning = \"Not evaluated by LLM.\"\n\n        if self.cumulative_motivation_salience >= self.llm_motivation_threshold_salience:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for motivation analysis (Salience: {self.cumulative_motivation_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_motivation()\n            llm_motivation_output = await self._infer_motivation_state_llm(context_for_llm)\n\n            if llm_motivation_output:\n                dominant_goal_id = llm_motivation_output.get('dominant_goal_id', dominant_goal_id)\n                overall_drive_level = max(0.0, min(1.0, llm_motivation_output.get('overall_drive_level', overall_drive_level)))\n                active_goals = llm_motivation_output.get('active_goals', active_goals)\n                llm_reasoning = llm_motivation_output.get('llm_reasoning', 'LLM provided no specific reasoning.')\n                rospy.loginfo(f\"{self.node_name}: LLM Inferred Motivation. Dominant Goal: '{dominant_goal_id}' (Drive: {overall_drive_level:.2f}).\")\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM failed to infer motivation state. Applying simple fallback.\")\n                dominant_goal_id, overall_drive_level, active_goals = self._apply_simple_motivation_rules()\n                llm_reasoning = \"Fallback to simple rules due to LLM failure.\"\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_motivation_salience:.2f}) for LLM motivation analysis. Applying simple rules.\")\n            dominant_goal_id, overall_drive_level, active_goals = self._apply_simple_motivation_rules()\n            llm_reasoning = \"Fallback to simple rules due to low salience.\"\n\n        self.current_motivation_state = {\n            'timestamp': str(rospy.get_time()),\n            'dominant_goal_id': dominant_goal_id,\n            'overall_drive_level': overall_drive_level,\n            'active_goals': active_goals\n        }\n\n        self.save_motivation_log(\n            id=str(uuid.uuid4()),\n            timestamp=str(rospy.get_time()),\n            dominant_goal_id=self.current_motivation_state['dominant_goal_id'],\n            overall_drive_level=self.current_motivation_state['overall_drive_level'],\n            active_goals_json=json.dumps(self.current_motivation_state['active_goals']),\n            llm_reasoning=llm_reasoning,\n            context_snapshot_json=json.dumps(self._compile_llm_context_for_motivation())\n        )\n        self.publish_motivation_state(None) # Publish updated state\n        self.cumulative_motivation_salience = 0.0 # Reset after analysis\n\n    async def _infer_motivation_state_llm(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to infer the robot's current motivation state, including\n        dominant goal and overall drive level.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Experience Motivation Module of a robot's cognitive architecture. Your role is to determine the robot's current dominant goal and its overall drive level by synthesizing inputs from various cognitive modules. This module is responsible for guiding the robot's actions towards its primary objectives.\n\n        Robot's Recent Cognitive Context (for Motivation Inference):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm, indent=2)}\n\n        Based on this context, provide:\n        1.  `dominant_goal_id`: string (The unique identifier or concise description of the robot's single most important current goal, e.g., 'serve_user', 'maintain_safety', 'learn_new_skill', 'recharge_battery', 'explore_environment').\n        2.  `overall_drive_level`: number (0.0 to 1.0, indicating the intensity or urgency of the robot's motivation towards this dominant goal. 1.0 is maximum drive).\n        3.  `active_goals`: array of objects (A list of all currently active goals, including the dominant one. Each object should have `goal_id`: string, `priority`: number (0.0-1.0), `status`: string (e.g., 'active', 'pending', 'completed', 'blocked')).\n        4.  `llm_reasoning`: string (Detailed explanation for your motivation inference, referencing specific contextual inputs that influenced goal selection or drive level.)\n\n        Consider:\n        -   **Cognitive Directives**: Are there explicit directives like 'SetGoal' or 'AdjustMotivation'?\n        -   **Emotion States**: Is the robot feeling `frustrated` (reduce drive for current goal, switch?), `happy` (reinforce current goal?), `curious` (trigger exploration goal?)?\n        -   **Performance Reports**: Was a task `suboptimal_flag`ged (reduce drive, or shift focus to self-improvement)? Was it highly `overall_score` (reinforce goal)?\n        -   **World Model**: Are there new `significant_change_flag`s, `opportunities`, or `obstacles` that affect current goals or suggest new ones?\n        -   **Memory Responses**: Are there recalled `past_goals`, `core_values`, or `success_metrics` that influence current motivation?\n        -   **Internal Narratives**: Is the robot's self-talk indicating desire, commitment, or conflict regarding goals?\n        -   **Social Cognition**: Has the user expressed a `inferred_intent` that should become a new goal?\n        -   **Prediction States**: Do `predicted_event`s make a goal more or less desirable (e.g., predicted success increases drive, predicted failure decreases)?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'dominant_goal_id': string\n        3.  'overall_drive_level': number\n        4.  'active_goals': array\n        5.  'llm_reasoning': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"dominant_goal_id\": {\"type\": \"string\"},\n                \"overall_drive_level\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                \"active_goals\": {\n                    \"type\": \"array\",\n                    \"items\": {\n                        \"type\": \"object\",\n                        \"properties\": {\n                            \"goal_id\": {\"type\": \"string\"},\n                            \"priority\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                            \"status\": {\"type\": \"string\"}\n                        },\n                        \"required\": [\"goal_id\", \"priority\", \"status\"]\n                    }\n                },\n                \"llm_reasoning\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"dominant_goal_id\", \"overall_drive_level\", \"active_goals\", \"llm_reasoning\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.5, max_tokens=350)\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure numerical fields are floats\n                if 'overall_drive_level' in llm_data: llm_data['overall_drive_level'] = float(llm_data['overall_drive_level'])\n                if 'active_goals' in llm_data:\n                    for goal in llm_data['active_goals']:\n                        if 'priority' in goal: goal['priority'] = float(goal['priority'])\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for motivation: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_MOTIVATION_ANALYSIS_FAILED\", f\"LLM call failed for motivation: {llm_output_str}\", 0.9)\n            return None\n\n    def _apply_simple_motivation_rules(self):\n        \"\"\"\n        Fallback mechanism to infer motivation state using simple rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        current_time = rospy.get_time()\n        \n        dominant_goal_id = self.current_motivation_state.get('dominant_goal_id', 'explore_environment')\n        overall_drive_level = self.current_motivation_state.get('overall_drive_level', 0.1)\n        active_goals = self.current_motivation_state.get('active_goals', [{'goal_id': 'explore_environment', 'priority': 0.1, 'status': 'active'}])\n\n        # Rule 1: Prioritize explicit directives to set a goal\n        for directive in reversed(self.recent_cognitive_directives):\n            time_since_directive = current_time - float(directive.get('timestamp', 0.0))\n            if time_since_directive < 2.0 and directive.get('target_node') == self.node_name and \\\n               directive.get('directive_type') == 'SetGoal':\n                payload = json.loads(directive.get('command_payload', '{}'))\n                new_goal_id = payload.get('goal_id', 'unspecified_goal')\n                new_goal_priority = payload.get('priority', 0.8) # High priority for direct commands\n\n                # Check if this goal is already active; if so, update its priority\n                found_existing = False\n                for goal in active_goals:\n                    if goal['goal_id'] == new_goal_id:\n                        goal['priority'] = max(goal['priority'], new_goal_priority)\n                        goal['status'] = 'active'\n                        found_existing = True\n                        break\n                if not found_existing:\n                    active_goals.append({'goal_id': new_goal_id, 'priority': new_goal_priority, 'status': 'active'})\n                \n                dominant_goal_id = new_goal_id\n                overall_drive_level = max(overall_drive_level, new_goal_priority) # Drive by highest priority goal\n                rospy.logdebug(f\"{self.node_name}: Simple rule: New dominant goal from directive: {dominant_goal_id}.\")\n                break # Process only the most recent 'SetGoal' directive\n\n        # Rule 2: React to low battery (critical survival goal)\n        if self.recent_world_model_states: # Assuming world model can reflect robot's own status or system health provides it\n            latest_world_state = self.recent_world_model_states[-1]\n            # This is a proxy, ideally a direct 'RobotHealth' sub would be better\n            if \"low_battery\" in latest_world_state.get('significant_change_flag', '').lower() or \\\n               any(entity.get('name') == 'robot_self' and entity.get('status') == 'low_power' for entity in latest_world_state.get('changed_entities', [])):\n                dominant_goal_id = 'recharge_battery'\n                overall_drive_level = 0.95\n                if not any(g['goal_id'] == 'recharge_battery' for g in active_goals):\n                    active_goals.append({'goal_id': 'recharge_battery', 'priority': 0.95, 'status': 'active'})\n                for goal in active_goals: # Ensure recharge is highest priority\n                    if goal['goal_id'] == 'recharge_battery':\n                        goal['priority'] = 0.95\n                        goal['status'] = 'active'\n                    else: # Lower priority of other goals\n                        goal['priority'] *= 0.5\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Prioritizing 'recharge_battery' due to low power.\")\n\n        # Rule 3: Adjust drive based on performance\n        if self.recent_performance_reports:\n            latest_perf = self.recent_performance_reports[-1]\n            if latest_perf.get('suboptimal_flag', False) and latest_perf.get('overall_score', 1.0) < 0.5:\n                # If current goal is failing badly, reduce drive or consider switching\n                overall_drive_level = max(0.0, overall_drive_level - 0.2)\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Reduced drive due to suboptimal performance.\")\n            elif latest_perf.get('overall_score', 0.0) > 0.9:\n                # If performing very well, boost drive slightly\n                overall_drive_level = min(1.0, overall_drive_level + 0.1)\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Increased drive due to high performance.\")\n\n        # Re-sort active goals by priority and ensure dominant_goal_id reflects the highest one\n        active_goals.sort(key=lambda x: x['priority'], reverse=True)\n        if active_goals:\n            dominant_goal_id = active_goals[0]['goal_id']\n            overall_drive_level = active_goals[0]['priority']\n        else:\n            # Fallback if no goals are active (shouldn't happen with default 'explore_environment')\n            dominant_goal_id = 'idle'\n            overall_drive_level = 0.0\n\n        rospy.logdebug(f\"{self.node_name}: Simple rule: Current Dominant Goal: {dominant_goal_id}, Drive: {overall_drive_level:.2f}.\")\n        return dominant_goal_id, overall_drive_level, active_goals\n\n\n    def _compile_llm_context_for_motivation(self):\n        \"\"\"\n        Gathers and formats all relevant cognitive state data for the LLM's\n        motivation inference.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"current_motivation_state\": self.current_motivation_state,\n            \"recent_cognitive_inputs\": {\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name],\n                \"emotion_states\": list(self.recent_emotion_states),\n                \"performance_reports\": list(self.recent_performance_reports),\n                \"world_model_states\": list(self.recent_world_model_states),\n                \"memory_responses\": list(self.recent_memory_responses),\n                \"internal_narratives\": list(self.recent_internal_narratives),\n                \"social_cognition_states\": list(self.recent_social_cognition_states),\n                \"prediction_states\": list(self.recent_prediction_states)\n            }\n        }\n        \n        # Deep parse any nested JSON strings in history for better LLM understanding\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            for i, item in enumerate(context[\"recent_cognitive_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try:\n                                item[field] = json.loads(value)\n                            except json.JSONDecodeError:\n                                pass # Keep as string if not valid JSON\n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_motivation_log(self, id, timestamp, dominant_goal_id, overall_drive_level, active_goals_json, llm_reasoning, context_snapshot_json):\n        \"\"\"Saves a motivation state entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO motivation_log (id, timestamp, dominant_goal_id, overall_drive_level, active_goals_json, llm_reasoning, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, dominant_goal_id, overall_drive_level, active_goals_json, llm_reasoning, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved motivation log (ID: {id}, Goal: {dominant_goal_id}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save motivation log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_motivation_log: {e}\", 0.9)\n\n\n    def publish_motivation_state(self, event):\n        \"\"\"Publishes the robot's current motivation state.\"\"\"\n        timestamp = str(rospy.get_time())\n        # Update timestamp before publishing\n        self.current_motivation_state['timestamp'] = timestamp\n        \n        try:\n            if isinstance(MotivationState, type(String)): # Fallback to String message\n                self.pub_motivation_state.publish(json.dumps(self.current_motivation_state))\n            else:\n                motivation_msg = MotivationState()\n                motivation_msg.timestamp = timestamp\n                motivation_msg.dominant_goal_id = self.current_motivation_state['dominant_goal_id']\n                motivation_msg.overall_drive_level = self.current_motivation_state['overall_drive_level']\n                motivation_msg.active_goals_json = json.dumps(self.current_motivation_state['active_goals'])\n                self.pub_motivation_state.publish(motivation_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published Motivation State. Goal: '{self.current_motivation_state['dominant_goal_id']}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_MOTIVATION_STATE_ERROR\", f\"Failed to publish motivation state: {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency, reason=\"\"):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency,\n                    'reason': reason\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                directive_msg.reason = reason\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to issue cognitive directive from Experience Motivation Node: {e}\")\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = ExperienceMotivationNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, ExperienceMotivationNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, ExperienceMotivationNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+```python:disable-run
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random
+import uuid  # For unique goal IDs
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Optional, Deque
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading
+from collections import deque
+
+# Optional ROS Integration (for compatibility)
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    MotivationState = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    EmotionState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+    SocialCognitionState = ROSMsgFallback
+    PredictionState = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    MotivationState = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    EmotionState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+    SocialCognitionState = ROSMsgFallback
+    PredictionState = ROSMsgFallback
+
+
+# --- Import shared utility functions ---
+# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        return {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,
+            'experience_motivation_node': {
+                'motivation_update_interval': 1.0,
+                'llm_motivation_threshold_salience': 0.6,
+                'recent_context_window_s': 15.0,
+                'ethical_compassion_bias': 0.2,  # Bias toward compassionate goal inference
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 30.0
+            }
+        }.get(node_name, {})  # Return node-specific or empty dict
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class ExperienceMotivationNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'experience_motivation_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized configuration ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "motivation_log.db")
+        self.motivation_update_interval = self.params.get('motivation_update_interval', 1.0)
+        self.llm_motivation_threshold_salience = self.params.get('llm_motivation_threshold_salience', 0.6)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 15.0)
+        self.ethical_compassion_bias = self.params.get('ethical_compassion_bias', 0.2)
+
+        # Sensory placeholders (e.g., vision/sound influencing motivation compassionately)
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+        self.vision_callback = self._create_sensory_placeholder('vision')
+        self.sound_callback = self._create_sensory_placeholder('sound')
+        self.instructions_callback = self._create_sensory_placeholder('instructions')
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 30.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Robot's experience motivation system online, inspiring compassionate and mindful goal-driven pursuit.")
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS motivation_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                dominant_goal_id TEXT,
+                overall_drive_level REAL,
+                active_goals_json TEXT,
+                llm_reasoning TEXT,
+                context_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_motivation_timestamp ON motivation_log (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.current_motivation_state = {
+            'timestamp': str(time.time()),
+            'dominant_goal_id': 'explore_environment',  # Default passive goal
+            'overall_drive_level': 0.1,
+            'active_goals': [{'goal_id': 'explore_environment', 'priority': 0.1, 'status': 'active'}]
+        }
+
+        # History deques
+        self.recent_cognitive_directives: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_emotion_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_performance_reports: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_world_model_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_memory_responses: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_internal_narratives: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_social_cognition_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_prediction_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+
+        self.cumulative_motivation_salience = 0.0
+
+        # --- ROS Compatibility: Conditional Setup ---
+        self.pub_motivation_state = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_motivation_state = rospy.Publisher('/motivation_state', MotivationState, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            rospy.Subscriber('/emotion_state', EmotionState, self.emotion_state_callback)
+            rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)
+            rospy.Subscriber('/world_model_state', WorldModelState, self.world_model_state_callback)
+            rospy.Subscriber('/memory_response', MemoryResponse, self.memory_response_callback)
+            rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback)
+            rospy.Subscriber('/social_cognition_state', SocialCognitionState, self.social_cognition_state_callback)
+            rospy.Subscriber('/prediction_state', PredictionState, self.prediction_state_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.motivation_update_interval), self._run_motivation_analysis_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._shutdown_flag = threading.Event()
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+        # Initial publish
+        self.publish_motivation_state(None)
+
+    def _create_sensory_placeholder(self, sensor_type: str):
+        """Dynamic placeholder for sensory inputs influencing motivation compassionately."""
+        def placeholder_callback(data: Any):
+            timestamp = time.time()
+            processed = data if isinstance(data, dict) else {'raw': str(data)}
+            # Simulate sensory influence on motivation
+            if sensor_type == 'vision':
+                self.recent_world_model_states.append({'timestamp': timestamp, 'significant_change_flag': random.random() < 0.3, 'num_entities': random.randint(1, 10)})
+            elif sensor_type == 'sound':
+                self.recent_emotion_states.append({'timestamp': timestamp, 'mood': random.choice(['curious', 'anxious', 'neutral']), 'mood_intensity': random.uniform(0.2, 0.8)})
+            elif sensor_type == 'instructions':
+                self.recent_cognitive_directives.append({'timestamp': timestamp, 'directive_type': 'set_goal', 'command_payload': json.dumps({'goal_id': 'user_request', 'priority': random.uniform(0.4, 0.9)})})
+            self._update_cumulative_salience(0.2)  # Sensory adds salience for motivation
+            _log_debug(self.node_name, f"{sensor_type} input updated motivation context at {timestamp}")
+        return placeholder_callback
+
+    def _dynamic_execution_loop(self):
+        """Dynamic polling loop when ROS is disabled."""
+        while not self._shutdown_flag.is_set():
+            self._run_motivation_analysis_wrapper(None)
+            time.sleep(self.motivation_update_interval)
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    # --- Asyncio Thread Management ---
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._create_async_session())
+        self._async_loop.run_forever()
+
+    async def _create_async_session(self):
+        _log_info(self.node_name, "Creating aiohttp ClientSession...")
+        self._async_session = aiohttp.ClientSession()
+        _log_info(self.node_name, "aiohttp ClientSession created.")
+
+    async def _close_async_session(self):
+        if self._async_session:
+            _log_info(self.node_name, "Closing aiohttp ClientSession...")
+            await self._async_session.close()
+            self._async_session = None
+            _log_info(self.node_name, "aiohttp ClientSession closed.")
+
+    def _shutdown_async_loop(self):
+        if self._async_loop and self._async_thread.is_alive():
+            _log_info(self.node_name, "Shutting down asyncio loop...")
+            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)
+            try:
+                future.result(timeout=5.0)
+            except asyncio.TimeoutError:
+                _log_warn(self.node_name, "Timeout waiting for async session to close.")
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._async_thread.join(timeout=5.0)
+            if self._async_thread.is_alive():
+                _log_warn(self.node_name, "Asyncio thread did not shut down gracefully.")
+            _log_info(self.node_name, "Asyncio loop shut down.")
+
+    def _run_motivation_analysis_wrapper(self, event: Any = None):
+        """Wrapper to run the async motivation analysis from a ROS timer."""
+        if self.active_llm_task and not self.active_llm_task.done():
+            _log_debug(self.node_name, "LLM motivation analysis task already active. Skipping new cycle.")
+            return
+        
+        # Schedule the async task
+        self.active_llm_task = asyncio.run_coroutine_threadsafe(
+            self.analyze_motivation_async(event), self._async_loop
+        )
+
+    # --- Error Reporting Utility ---
+    def _report_error(self, error_type: str, description: str, severity: float = 0.5, context: Optional[Dict] = None):
+        timestamp = str(self._get_current_time())
+        error_msg_data = {
+            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,
+            'description': description, 'severity': severity, 'context': context or {}
+        }
+        if ROS_AVAILABLE and self.ros_enabled and self.pub_error_report:
+            try:
+                self.pub_error_report.publish(String(data=json.dumps(error_msg_data)))
+                rospy.logerr(f"{self.node_name}: REPORTED ERROR: {error_type} - {description}")
+            except Exception as e:
+                _log_error(self.node_name, f"Failed to publish error report: {e}")
+        else:
+            _log_error(self.node_name, f"REPORTED ERROR: {error_type} - {description} (Severity: {severity})")
+
+    # --- LLM Call Function ---
+    async def _call_llm_api(self, prompt_text: str, response_schema: Optional[Dict] = None, temperature: float = 0.5, max_tokens: int = 300) -> str:
+        """
+        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).
+        Can optionally request a structured JSON response. Moderate temperature for goal-setting nuance.
+        """
+        if not self._async_session:
+            await self._create_async_session()
+            if not self._async_session:
+                self._report_error("LLM_SESSION_ERROR", "aiohttp session not available for LLM call.", 0.8)
+                return "Error: LLM session not ready."
+
+        payload = {
+            "model": self.llm_model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": temperature,  # Moderate temperature for goal-setting nuance
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        if response_schema:
+            prompt_text += "\n\nProvide the response in JSON format according to this schema:\n" + json.dumps(response_schema, indent=2)
+            payload["messages"] = [{"role": "user", "content": prompt_text}]
+
+        api_url = self.llm_base_url
+
+        try:
+            async with self._async_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=self.llm_timeout), headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                if result.get('choices') and result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
+                    return result['choices'][0]['message']['content']
+                
+                self._report_error("LLM_RESPONSE_EMPTY", "LLM response had no content from local server.", 0.5, {'prompt_snippet': prompt_text[:100]})
+                return "Error: LLM response empty."
+        except aiohttp.ClientError as e:
+            self._report_error("LLM_API_ERROR", f"LLM API request failed (aiohttp ClientError to local server): {e}", 0.9, {'url': api_url})
+            return f"Error: LLM API request failed: {e}"
+        except asyncio.TimeoutError:
+            self._report_error("LLM_TIMEOUT", f"LLM API request timed out after {self.llm_timeout} seconds (local server).", 0.8, {'prompt_snippet': prompt_text[:100]})
+            return "Error: LLM API request timed out."
+        except json.JSONDecodeError:
+            self._report_error("LLM_JSON_PARSE_ERROR", "Failed to parse local LLM response JSON.", 0.7)
+            return "Error: Failed to parse LLM response."
+        except Exception as e:
+            self._report_error("UNEXPECTED_LLM_ERROR", f"An unexpected error occurred during local LLM call: {e}", 0.9, {'prompt_snippet': prompt_text[:100]})
+            return f"Error: An unexpected error occurred: {e}"
+
+    # --- Utility to accumulate input salience ---
+    def _update_cumulative_salience(self, score: float):
+        """Accumulates salience from new inputs for triggering LLM analysis."""
+        self.cumulative_motivation_salience += score
+        self.cumulative_motivation_salience = min(1.0, self.cumulative_motivation_salience)
+
+    # --- Pruning old history ---
+    def _prune_history(self):
+        """Removes old entries from history deques based on recent_context_window_s."""
+        current_time = self._get_current_time()
+        for history_deque in [
+            self.recent_cognitive_directives, self.recent_emotion_states,
+            self.recent_performance_reports, self.recent_world_model_states,
+            self.recent_memory_responses, self.recent_internal_narratives,
+            self.recent_social_cognition_states, self.recent_prediction_states
+        ]:
+            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:
+                history_deque.popleft()
+
+    # --- Callbacks (generic, ROS or direct) ---
+    def cognitive_directive_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),
+            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),
+            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        
+        if data.get('target_node') == self.node_name:
+            self.recent_cognitive_directives.append(data)  # Add directives for self to context
+            # Directives to set new goals or adjust motivation are highly salient
+            if data.get('directive_type') in ['SetGoal', 'AdjustMotivation']:
+                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)
+            _log_info(self.node_name, f"Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}.)")
+        else:
+            self.recent_cognitive_directives.append(data)  # Add all directives for general context
+        _log_debug(self.node_name, "Cognitive Directive received for context/action.")
+
+    def emotion_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'mood': ('neutral', 'mood'),
+            'sentiment_score': (0.0, 'sentiment_score'), 'mood_intensity': (0.0, 'mood_intensity')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_emotion_states.append(data)
+        # Strong emotions can influence motivation (e.g., frustration leading to change goal, happiness reinforcing current goal)
+        if data.get('mood_intensity', 0.0) > 0.5:
+            self._update_cumulative_salience(data.get('mood_intensity', 0.0) * 0.3)
+        _log_debug(self.node_name, f"Received Emotion State. Mood: {data.get('mood', 'N/A')}.")
+
+    def performance_report_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),
+            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('kpis_json'), str):
+            try:
+                data['kpis'] = json.loads(data['kpis_json'])
+            except json.JSONDecodeError:
+                data['kpis'] = {}
+        self.recent_performance_reports.append(data)
+        # Suboptimal performance can decrease motivation for current goal, high performance can increase
+        if data.get('suboptimal_flag', False) or data.get('overall_score', 1.0) < 0.7:
+            self._update_cumulative_salience(0.5)  # Need to re-evaluate if not doing well
+        elif data.get('overall_score', 0.0) > 0.9:
+            self._update_cumulative_salience(0.2)  # Reinforce success
+        _log_debug(self.node_name, f"Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}.")
+
+    def world_model_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),
+            'changed_entities_json': ('[]', 'changed_entities_json'),
+            'significant_change_flag': (False, 'significant_change_flag'),
+            'consistency_score': (1.0, 'consistency_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('changed_entities_json'), str):
+            try:
+                data['changed_entities'] = json.loads(data['changed_entities_json'])
+            except json.JSONDecodeError:
+                data['changed_entities'] = []
+        self.recent_world_model_states.append(data)
+        # Changes in world model can present new opportunities or obstacles to current goals
+        if data.get('significant_change_flag', False):
+            self._update_cumulative_salience(0.4)
+        _log_debug(self.node_name, f"Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.")
+
+    def memory_response_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'request_id': ('', 'request_id'),
+            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('memories_json'), str):
+            try:
+                data['memories'] = json.loads(data['memories_json'])
+            except json.JSONDecodeError:
+                data['memories']
+```

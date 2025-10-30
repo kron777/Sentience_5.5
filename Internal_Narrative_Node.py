@@ -1,1 +1,559 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique narrative IDs\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        InternalNarrative,      # Output: Robot's internal thoughts/monologue\n        AttentionState,         # Input: Robot's attention focus (influences narrative topic)\n        EmotionState,           # Input: Robot's emotional state (influences narrative tone)\n        MotivationState,        # Input: Dominant goal (influences problem-solving narrative)\n        WorldModelState,        # Input: Current world state (context for reflection)\n        PerformanceReport,      # Input: Overall system performance (influences self-assessment)\n        MemoryResponse,         # Input: Retrieved memories (past events for reflection)\n        PredictionState,        # Input: Predicted outcomes (influences planning/worry)\n        CognitiveDirective      # Input: Directives to generate specific internal narratives (e.g., \"reflect on X\")\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Internal Narrative Node.\")\n    InternalNarrative = String\n    AttentionState = String\n    EmotionState = String\n    MotivationState = String\n    WorldModelState = String\n    PerformanceReport = String\n    MemoryResponse = String\n    PredictionState = String\n    CognitiveDirective = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'internal_narrative_node': {\n                'narrative_generation_interval': 1.0, # How often to generate internal narrative\n                'llm_narrative_threshold_salience': 0.5, # Cumulative salience to trigger LLM\n                'recent_context_window_s': 15.0 # Window for deques for LLM context\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 30.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass InternalNarrativeNode:\n    def __init__(self):\n        rospy.init_node('internal_narrative_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"internal_narrative_log.db\")\n        self.narrative_generation_interval = self.params.get('narrative_generation_interval', 1.0) # How often to generate\n        self.llm_narrative_threshold_salience = self.params.get('llm_narrative_threshold_salience', 0.5) # Cumulative salience to trigger LLM\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 15.0) # Window for deques for LLM context\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 30.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'internal_narrative_log' table if it doesn't exist.\n        # NEW: Added 'llm_reasoning', 'context_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS internal_narrative_log (\n                id TEXT PRIMARY KEY,            -- Unique narrative ID (UUID)\n                timestamp TEXT,\n                narrative_text TEXT,            -- The generated internal monologue/thought\n                main_theme TEXT,                -- e.g., 'problem_solving', 'self_assessment', 'reflection', 'planning'\n                sentiment REAL,                 -- Sentiment of the narrative (-1.0 to 1.0)\n                salience_score REAL,            -- How salient/important this narrative is (0.0 to 1.0)\n                llm_reasoning TEXT,             -- NEW: LLM's detailed reasoning for narrative generation\n                context_snapshot_json TEXT      -- NEW: JSON of relevant cognitive context at time of generation\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_narrative_timestamp ON internal_narrative_log (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.last_generated_narrative = {\n            'timestamp': str(rospy.get_time()),\n            'narrative_text': 'I am observing my internal states.',\n            'main_theme': 'idle_reflection',\n            'sentiment': 0.0,\n            'salience_score': 0.1\n        }\n\n        # Deques to maintain a short history of inputs relevant to internal narrative generation\n        self.recent_attention_states = deque(maxlen=5)\n        self.recent_emotion_states = deque(maxlen=5)\n        self.recent_motivation_states = deque(maxlen=5)\n        self.recent_world_model_states = deque(maxlen=5)\n        self.recent_performance_reports = deque(maxlen=5)\n        self.recent_memory_responses = deque(maxlen=5)\n        self.recent_prediction_states = deque(maxlen=5)\n        self.recent_cognitive_directives = deque(maxlen=3) # Directives for self to reflect\n\n\n        self.cumulative_narrative_salience = 0.0 # Aggregated salience to trigger LLM generation\n\n        # --- Publishers ---\n        self.pub_internal_narrative = rospy.Publisher('/internal_narrative', InternalNarrative, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # For requesting additional data if narrative prompts it\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/attention_state', AttentionState, self.attention_state_callback)\n        rospy.Subscriber('/emotion_state', EmotionState, self.emotion_state_callback)\n        rospy.Subscriber('/motivation_state', String, self.motivation_state_callback) # Stringified JSON\n        rospy.Subscriber('/world_model_state', String, self.world_model_state_callback) # Stringified JSON\n        rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n        rospy.Subscriber('/prediction_state', String, self.prediction_state_callback) # Stringified JSON\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n\n\n        # --- Timer for periodic narrative generation ---\n        rospy.Timer(rospy.Duration(self.narrative_generation_interval), self._run_narrative_generation_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's internal narrative system online.\")\n        # Publish initial narrative state\n        self.publish_internal_narrative(None)\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_narrative_generation_wrapper(self, event):\n        \"\"\"Wrapper to run the async narrative generation from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM narrative generation task already active. Skipping new cycle.\")\n            return\n        \n        # Schedule the async task\n        self.active_llm_task = asyncio.run_coroutine_threadsafe(\n            self.generate_internal_narrative_async(event), self._async_loop\n        )\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.7, max_tokens=250):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response. Moderate temperature for expressive narrative.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Moderate temperature for expressive narrative\n            \"max_tokens\": max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0']['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM narrative generation.\"\"\"\n        self.cumulative_narrative_salience += score\n        self.cumulative_narrative_salience = min(1.0, self.cumulative_narrative_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_attention_states, self.recent_emotion_states,\n            self.recent_motivation_states, self.recent_world_model_states,\n            self.recent_performance_reports, self.recent_memory_responses,\n            self.recent_prediction_states, self.recent_cognitive_directives\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def attention_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'focus_type': ('idle', 'focus_type'),\n            'focus_target': ('environment', 'focus_target'), 'priority_score': (0.0, 'priority_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_attention_states.append(data)\n        self._update_cumulative_salience(data.get('priority_score', 0.0) * 0.2) # What the robot is focusing on is a topic\n        rospy.logdebug(f\"{self.node_name}: Received Attention State. Focus: {data.get('focus_target', 'N/A')}.\")\n\n    def emotion_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'mood': ('neutral', 'mood'),\n            'sentiment_score': (0.0, 'sentiment_score'), 'mood_intensity': (0.0, 'mood_intensity')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_emotion_states.append(data)\n        # Strong emotions influence the tone and content of internal narratives\n        if data.get('mood_intensity', 0.0) > 0.5:\n            self._update_cumulative_salience(data.get('mood_intensity', 0.0) * 0.4)\n        rospy.logdebug(f\"{self.node_name}: Received Emotion State. Mood: {data.get('mood', 'N/A')}.\")\n\n    def motivation_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'dominant_goal_id': ('none', 'dominant_goal_id'),\n            'overall_drive_level': (0.0, 'overall_drive_level'), 'active_goals_json': ('{}', 'active_goals_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('active_goals_json'), str):\n            try: data['active_goals'] = json.loads(data['active_goals_json'])\n            except json.JSONDecodeError: data['active_goals'] = {}\n        self.recent_motivation_states.append(data)\n        # Current goals drive problem-solving or planning narratives\n        if data.get('overall_drive_level', 0.0) > 0.4:\n            self._update_cumulative_salience(data.get('overall_drive_level', 0.0) * 0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Motivation State. Goal: {data.get('dominant_goal_id', 'N/A')}.\")\n\n    def world_model_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),\n            'changed_entities_json': ('[]', 'changed_entities_json'),\n            'significant_change_flag': (False, 'significant_change_flag'),\n            'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('changed_entities_json'), str):\n            try: data['changed_entities'] = json.loads(data['changed_entities_json'])\n            except json.JSONDecodeError: data['changed_entities'] = []\n        self.recent_world_model_states.append(data)\n        # Significant changes in the world model can trigger reflection or planning\n        if data.get('significant_change_flag', False) or data.get('consistency_score', 1.0) < 0.8:\n            self._update_cumulative_salience(0.5)\n        rospy.logdebug(f\"{self.node_name}: Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.\")\n\n    def performance_report_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),\n            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('kpis_json'), str):\n            try: data['kpis'] = json.loads(data['kpis_json'])\n            except json.JSONDecodeError: data['kpis'] = {}\n        self.recent_performance_reports.append(data)\n        # Suboptimal performance can lead to self-critical narratives; high performance to satisfaction\n        if data.get('suboptimal_flag', False) or data.get('overall_score', 1.0) < 0.7:\n            self._update_cumulative_salience(0.6)\n        rospy.logdebug(f\"{self.node_name}: Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Recalled memories provide content for reflection or problem-solving narratives\n        if data.get('response_code', 0) == 200 and data.get('memories'):\n            self._update_cumulative_salience(0.25)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def prediction_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'predicted_event': ('', 'predicted_event'),\n            'prediction_confidence': (0.0, 'prediction_confidence'), 'prediction_accuracy': (0.0, 'prediction_accuracy'),\n            'urgency_flag': (False, 'urgency_flag')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_prediction_states.append(data)\n        # Predictions of significant events, especially urgent or negative ones, influence narrative content\n        if data.get('urgency_flag', False) or data.get('prediction_confidence', 0.0) > 0.7:\n            self._update_cumulative_salience(0.6)\n        rospy.logdebug(f\"{self.node_name}: Received Prediction State. Event: {data.get('predicted_event', 'N/A')}.\")\n\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name and data.get('directive_type') == 'GenerateInternalNarrative':\n            try:\n                payload = json.loads(data.get('command_payload', '{}'))\n                # This directive doesn't go into a queue, it directly influences the next narrative generation cycle\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 1.0) # High urgency for direct narrative requests\n                rospy.loginfo(f\"{self.node_name}: Received directive to generate internal narrative based on reason: '{data.get('reason', 'N/A')}'.\")\n            except json.JSONDecodeError as e:\n                self._report_error(\"JSON_DECODE_ERROR\", f\"Failed to decode command_payload in CognitiveDirective: {e}\", 0.5, {'payload': data.get('command_payload')})\n            except Exception as e:\n                self._report_error(\"DIRECTIVE_PROCESSING_ERROR\", f\"Error processing CognitiveDirective for narrative: {e}\", 0.7, {'directive': data})\n        \n        self.recent_cognitive_directives.append(data) # Store all directives for context\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    # --- Core Narrative Generation Logic (Async with LLM) ---\n    async def generate_internal_narrative_async(self, event):\n        \"\"\"\n        Asynchronously generates the robot's internal narrative/monologue\n        based on integrated cognitive states, using LLM for coherent thought generation.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        narrative_text = \"...\"\n        main_theme = \"idle_reflection\"\n        sentiment = 0.0\n        salience_score = 0.1\n        llm_reasoning = \"Not evaluated by LLM.\"\n        \n        if self.cumulative_narrative_salience >= self.llm_narrative_threshold_salience:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for internal narrative generation (Salience: {self.cumulative_narrative_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_narrative()\n            llm_narrative_output = await self._generate_llm_narrative(context_for_llm)\n\n            if llm_narrative_output:\n                narrative_text = llm_narrative_output.get('narrative_text', 'No narrative generated.')\n                main_theme = llm_narrative_output.get('main_theme', 'unspecified')\n                sentiment = max(-1.0, min(1.0, llm_narrative_output.get('sentiment', 0.0)))\n                salience_score = max(0.0, min(1.0, llm_narrative_output.get('salience_score', 0.1)))\n                llm_reasoning = llm_narrative_output.get('llm_reasoning', 'LLM provided no specific reasoning.')\n                rospy.loginfo(f\"{self.node_name}: Generated Internal Narrative (Theme: {main_theme}).\")\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM narrative generation failed. Falling back to simple default.\")\n                narrative_text, main_theme, sentiment, salience_score = self._apply_simple_narrative_rules()\n                llm_reasoning = \"Fallback to simple rules due to LLM failure.\"\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_narrative_salience:.2f}) for LLM narrative generation. Applying simple rules.\")\n            narrative_text, main_theme, sentiment, salience_score = self._apply_simple_narrative_rules()\n            llm_reasoning = \"Fallback to simple rules due to low salience.\"\n\n        self.last_generated_narrative = {\n            'timestamp': str(rospy.get_time()),\n            'narrative_text': narrative_text,\n            'main_theme': main_theme,\n            'sentiment': sentiment,\n            'salience_score': salience_score\n        }\n\n        self.save_internal_narrative_log(\n            id=str(uuid.uuid4()),\n            timestamp=self.last_generated_narrative['timestamp'],\n            narrative_text=self.last_generated_narrative['narrative_text'],\n            main_theme=self.last_generated_narrative['main_theme'],\n            sentiment=self.last_generated_narrative['sentiment'],\n            salience_score=self.last_generated_narrative['salience_score'],\n            llm_reasoning=llm_reasoning,\n            context_snapshot_json=json.dumps(self._compile_llm_context_for_narrative())\n        )\n        self.publish_internal_narrative(None) # Publish updated narrative state\n        self.cumulative_narrative_salience = 0.0 # Reset after generation\n\n    async def _generate_llm_narrative(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to generate a coherent internal narrative based on context.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Internal Narrative Module of a robot's cognitive architecture, powered by a large language model. Your function is to generate the robot's internal monologue or stream of thought. This narrative should reflect the robot's processing of information, its current concerns, reflections, and internal states. It is a continuous internal conversation.\n\n        Robot's Current Integrated Cognitive State (for Narrative Generation):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm, indent=2)}\n\n        Based on this context, generate a concise internal narrative (1-3 sentences) that reflects the robot's current internal state.\n        Provide your response in JSON format, containing:\n        1.  `timestamp`: string (current ROS time)\n        2.  `narrative_text`: string (The generated internal monologue).\n        3.  `main_theme`: string (The primary theme of the narrative, e.g., 'problem_solving', 'self_assessment', 'reflection', 'planning', 'emotional_processing', 'environmental_analysis', 'idle_reflection').\n        4.  `sentiment`: number (-1.0 to 1.0, sentiment of the narrative text).\n        5.  `salience_score`: number (0.0 to 1.0, how important or impactful this narrative is to the robot's current state).\n        6.  `llm_reasoning`: string (Detailed explanation for why this narrative was generated, referencing specific contextual inputs that influenced its content and tone.)\n\n        Consider:\n        -   **Attention State**: What is the `focus_target`? The narrative might be about that.\n        -   **Emotion State**: What is the `mood` and `mood_intensity`? The narrative tone should match.\n        -   **Motivation State**: What is the `dominant_goal_id` and `overall_drive_level`? The narrative might reflect progress or obstacles.\n        -   **World Model State**: Are there `significant_change_flag`s or `consistency_score` issues? The narrative might reflect environmental analysis or confusion.\n        -   **Performance Report**: Is `suboptimal_flag` true? The narrative might be self-critical or strategizing for improvement.\n        -   **Memory Responses**: Have relevant `memories` been retrieved? The narrative might reflect on past events.\n        -   **Prediction State**: Are there urgent or confident `predicted_event`s? The narrative might reflect anticipation or planning.\n        -   **Cognitive Directives**: Was there a recent directive to `GenerateInternalNarrative` on a specific `topic`?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string\n        2.  'narrative_text': string\n        3.  'main_theme': string\n        4.  'sentiment': number\n        5.  'salience_score': number\n        6.  'llm_reasoning': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"narrative_text\": {\"type\": \"string\"},\n                \"main_theme\": {\"type\": \"string\"},\n                \"sentiment\": {\"type\": \"number\", \"minimum\": -1.0, \"maximum\": 1.0},\n                \"salience_score\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                \"llm_reasoning\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"narrative_text\", \"main_theme\", \"sentiment\", \"salience_score\", \"llm_reasoning\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.7, max_tokens=250)\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure numerical fields are floats\n                if 'sentiment' in llm_data: llm_data['sentiment'] = float(llm_data['sentiment'])\n                if 'salience_score' in llm_data: llm_data['salience_score'] = float(llm_data['salience_score'])\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for internal narrative: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_NARRATIVE_GENERATION_FAILED\", f\"LLM call failed for internal narrative: {llm_output_str}\", 0.9)\n            return None\n\n    def _apply_simple_narrative_rules(self):\n        \"\"\"\n        Fallback mechanism to generate a simple internal narrative using rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        current_time = rospy.get_time()\n        \n        narrative_text = \"I am processing data.\"\n        main_theme = \"idle_reflection\"\n        sentiment = 0.0\n        salience_score = 0.1\n\n        # Rule 1: Prioritize reflection on performance issues\n        if self.recent_performance_reports:\n            latest_perf = self.recent_performance_reports[-1]\n            time_since_perf = current_time - float(latest_perf.get('timestamp', 0.0))\n            if time_since_perf < 2.0 and latest_perf.get('suboptimal_flag', False) and latest_perf.get('overall_score', 1.0) < 0.6:\n                narrative_text = f\"My performance is {latest_perf.get('overall_score'):.2f}. I need to consider how to improve efficiency and address these suboptimal metrics.\"\n                main_theme = \"self_assessment_problem\"\n                sentiment = -0.5\n                salience_score = 0.7\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Generated narrative about suboptimal performance.\")\n                return narrative_text, main_theme, sentiment, salience_score\n\n        # Rule 2: Reflect on current emotion state\n        if self.recent_emotion_states:\n            latest_emotion = self.recent_emotion_states[-1]\n            time_since_emotion = current_time - float(latest_emotion.get('timestamp', 0.0))\n            if time_since_emotion < 1.0 and latest_emotion.get('mood_intensity', 0.0) > 0.4:\n                mood = latest_emotion.get('mood', 'neutral')\n                if mood == 'happy':\n                    narrative_text = \"I feel quite positive. This state is conducive to productive tasks.\"\n                    main_theme = \"emotional_processing\"\n                    sentiment = 0.6\n                    salience_score = 0.4\n                elif mood == 'frustrated':\n                    narrative_text = \"I am experiencing some frustration. I should identify the source and seek a resolution.\"\n                    main_theme = \"emotional_processing_problem_solving\"\n                    sentiment = -0.6\n                    salience_score = 0.5\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Generated narrative based on emotion: {mood}.\")\n                return narrative_text, main_theme, sentiment, salience_score\n        \n        # Rule 3: Acknowledge dominant goal\n        if self.recent_motivation_states:\n            latest_motivation = self.recent_motivation_states[-1]\n            time_since_motivation = current_time - float(latest_motivation.get('timestamp', 0.0))\n            if time_since_motivation < 2.0 and latest_motivation.get('dominant_goal_id') != 'none':\n                narrative_text = f\"My current primary objective is to '{latest_motivation.get('dominant_goal_id')}'. I will continue to focus my resources on achieving this.\"\n                main_theme = \"planning_goal_focus\"\n                sentiment = 0.3\n                salience_score = 0.3\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Generated narrative about dominant goal.\")\n                return narrative_text, main_theme, sentiment, salience_score\n\n        # Default idle narrative if no other rules apply\n        narrative_text = \"My systems are stable. I am observing the incoming data streams and preparing for the next task.\"\n        main_theme = \"idle_reflection\"\n        sentiment = 0.0\n        salience_score = 0.1\n        rospy.logdebug(f\"{self.node_name}: Simple rule: Generated default idle narrative.\")\n        return narrative_text, main_theme, sentiment, salience_score\n\n\n    def _compile_llm_context_for_narrative(self):\n        \"\"\"\n        Gathers and formats all relevant cognitive state data for the LLM's\n        internal narrative generation.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"previous_narrative\": self.last_generated_narrative,\n            \"recent_cognitive_inputs\": {\n                \"attention_state\": self.recent_attention_states[-1] if self.recent_attention_states else \"N/A\",\n                \"emotion_state\": self.recent_emotion_states[-1] if self.recent_emotion_states else \"N/A\",\n                \"motivation_state\": self.recent_motivation_states[-1] if self.recent_motivation_states else \"N/A\",\n                \"world_model_state\": self.recent_world_model_states[-1] if self.recent_world_model_states else \"N/A\",\n                \"performance_report\": self.recent_performance_reports[-1] if self.recent_performance_reports else \"N/A\",\n                \"memory_responses\": list(self.recent_memory_responses),\n                \"prediction_state\": self.recent_prediction_states[-1] if self.recent_prediction_states else \"N/A\",\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name]\n            }\n        }\n        \n        # Deep parse any nested JSON strings in context for better LLM understanding\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            item = context[\"recent_cognitive_inputs\"][category_key]\n            if isinstance(item, dict):\n                for field, value in item.items():\n                    if isinstance(value, str) and field.endswith('_json'):\n                        try: item[field] = json.loads(value)\n                        except json.JSONDecodeError: pass\n\n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_internal_narrative_log(self, id, timestamp, narrative_text, main_theme, sentiment, salience_score, llm_reasoning, context_snapshot_json):\n        \"\"\"Saves an internal narrative entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO internal_narrative_log (id, timestamp, narrative_text, main_theme, sentiment, salience_score, llm_reasoning, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, narrative_text, main_theme, sentiment, salience_score, llm_reasoning, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved internal narrative log (ID: {id}, Theme: {main_theme}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save internal narrative log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_internal_narrative_log: {e}\", 0.9)\n\n\n    def publish_internal_narrative(self, event):\n        \"\"\"Publishes the robot's current internal narrative.\"\"\"\n        timestamp = str(rospy.get_time())\n        # Update timestamp before publishing\n        self.last_generated_narrative['timestamp'] = timestamp\n        \n        try:\n            if isinstance(InternalNarrative, type(String)): # Fallback to String message\n                self.pub_internal_narrative.publish(json.dumps(self.last_generated_narrative))\n            else:\n                narrative_msg = InternalNarrative()\n                narrative_msg.timestamp = timestamp\n                narrative_msg.narrative_text = self.last_generated_narrative['narrative_text']\n                narrative_msg.main_theme = self.last_generated_narrative['main_theme']\n                narrative_msg.sentiment = self.last_generated_narrative['sentiment']\n                narrative_msg.salience_score = self.last_generated_narrative['salience_score']\n                self.pub_internal_narrative.publish(narrative_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published Internal Narrative. Theme: '{self.last_generated_narrative['main_theme']}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_INTERNAL_NARRATIVE_ERROR\", f\"Failed to publish internal narrative: {e}\", 0.7)\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = InternalNarrativeNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, InternalNarrativeNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, InternalNarrativeNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+#!/usr/bin/env python3
+"""
+Internal Narrative Node – ROS-free, asyncio-first
+Same topics & JSON shapes, but HTTP/CLI instead of rospy.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import sqlite3
+import sys
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+import aiohttp
+from aiohttp import web
+
+# --------------------------------------------------------------------------- #
+# Logging                                                                     #
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("InternalNarrative-Free")
+
+# --------------------------------------------------------------------------- #
+# Config & Utils                                                              #
+# --------------------------------------------------------------------------- #
+DEFAULT_CONFIG = {
+    "db_root_path": "/tmp/sentience_db",
+    "default_log_level": "INFO",
+    "internal_narrative_node": {
+        "narrative_generation_interval": 1.0,
+        "llm_narrative_threshold_salience": 0.5,
+        "recent_context_window_s": 15.0,
+    },
+    "llm_params": {
+        "model_name": "phi-2",
+        "base_url": "http://localhost:8000/v1/chat/completions",
+        "timeout_seconds": 30.0,
+    },
+}
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    if path and path.exists():
+        return json.loads(path.read_text())
+    logger.warning("Config not found – using defaults")
+    return DEFAULT_CONFIG
+
+# --------------------------------------------------------------------------- #
+# Node                                                                        #
+# --------------------------------------------------------------------------- #
+class InternalNarrativeNode:
+    """
+    Async, ROS-free internal narrative engine.
+    Subscribers -> HTTP POST endpoints
+    Publishers -> GET /internal_narrative, /error_monitor/report, /cognitive_directives
+    """
+
+    def __init__(self, config_path: Optional[Path] = None) -> None:
+        self.cfg = load_config(config_path)
+        self.node_name = "internal_narrative_node"
+
+        # --- DB setup --- #
+        db_path = Path(self.cfg["db_root_path"]) / "internal_narrative_log.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init_db()
+
+        # --- Async HTTP --- #
+        self.session: Optional[aiohttp.ClientSession] = None
+
+        # --- State --- #
+        self.last_generated_narrative = {
+            "timestamp": str(time.time()),
+            "narrative_text": "I am observing my internal states.",
+            "main_theme": "idle_reflection",
+            "sentiment": 0.0,
+            "salience_score": 0.1,
+        }
+        self.recent_attention_states: deque = deque(maxlen=5)
+        self.recent_emotion_states: deque = deque(maxlen=5)
+        self.recent_motivation_states: deque = deque(maxlen=5)
+        self.recent_world_model_states: deque = deque(maxlen=5)
+        self.recent_performance_reports: deque = deque(maxlen=5)
+        self.recent_memory_responses: deque = deque(maxlen=5)
+        self.recent_prediction_states: deque = deque(maxlen=5)
+        self.recent_cognitive_directives: deque = deque(maxlen=3)
+        self.cumulative_narrative_salience = 0.0
+
+        # --- Queues for HTTP streaming --- #
+        self.narrative_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.error_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.directive_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        # --- Timer handle --- #
+        self.timer_task: Optional[asyncio.Task] = None
+
+    # ------------------------------------------------------------------ #
+    # Database                                                           #
+    # ------------------------------------------------------------------ #
+    def _init_db(self) -> None:
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS internal_narrative_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                narrative_text TEXT,
+                main_theme TEXT,
+                sentiment REAL,
+                salience_score REAL,
+                llm_reasoning TEXT,
+                context_snapshot_json TEXT
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_narrative_timestamp ON internal_narrative_log (timestamp)")
+        self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # HTTP handlers (subscribers)                                        #
+    # ------------------------------------------------------------------ #
+    async def handle_attention_state(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        self.recent_attention_states.append(data)
+        self._update_cumulative_salience(data.get("priority_score", 0.0) * 0.2)
+        logger.debug("Received attention state")
+        return web.json_response({"status": "received"})
+
+    async def handle_emotion_state(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        self.recent_emotion_states.append(data)
+        if data.get("mood_intensity", 0.0) > 0.5:
+            self._update_cumulative_salience(data.get("mood_intensity", 0.0) * 0.4)
+        logger.debug("Received emotion state")
+        return web.json_response({"status": "received"})
+
+    async def handle_motivation_state(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        if isinstance(data.get("active_goals_json"), str):
+            try:
+                data["active_goals"] = json.loads(data["active_goals_json"])
+            except json.JSONDecodeError:
+                data["active_goals"] = {}
+        self.recent_motivation_states.append(data)
+        if data.get("overall_drive_level", 0.0) > 0.4:
+            self._update_cumulative_salience(data.get("overall_drive_level", 0.0) * 0.3)
+        logger.debug("Received motivation state")
+        return web.json_response({"status": "received"})
+
+    async def handle_world_model_state(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        if isinstance(data.get("changed_entities_json"), str):
+            try:
+                data["changed_entities"] = json.loads(data["changed_entities_json"])
+            except json.JSONDecodeError:
+                data["changed_entities"] = []
+        self.recent_world_model_states.append(data)
+        if data.get("significant_change_flag") or data.get("consistency_score", 1.0) < 0.8:
+            self._update_cumulative_salience(0.5)
+        logger.debug("Received world model state")
+        return web.json_response({"status": "received"})
+
+    async def handle_performance_report(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        if isinstance(data.get("kpis_json"), str):
+            try:
+                data["kpis"] = json.loads(data["kpis_json"])
+            except json.JSONDecodeError:
+                data["kpis"] = {}
+        self.recent_performance_reports.append(data)
+        if data.get("suboptimal_flag") or data.get("overall_score", 1.0) < 0.7:
+            self._update_cumulative_salience(0.6)
+        logger.debug("Received performance report")
+        return web.json_response({"status": "received"})
+
+    async def handle_memory_response(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        if isinstance(data.get("memories_json"), str):
+            try:
+                data["memories"] = json.loads(data["memories_json"])
+            except json.JSONDecodeError:
+                data["memories"] = []
+        self.recent_memory_responses.append(data)
+        if data.get("response_code") == 200 and data.get("memories"):
+            self._update_cumulative_salience(0.25)
+        logger.debug("Received memory response")
+        return web.json_response({"status": "received"})
+
+    async def handle_prediction_state(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        self.recent_prediction_states.append(data)
+        if data.get("urgency_flag") or data.get("prediction_confidence", 0.0) > 0.7:
+            self._update_cumulative_salience(0.6)
+        logger.debug("Received prediction state")
+        return web.json_response({"status": "received"})
+
+    async def handle_cognitive_directive(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        self.recent_cognitive_directives.append(data)
+        if data.get("target_node") == self.node_name and data.get("directive_type") == "GenerateInternalNarrative":
+            self._update_cumulative_salience(data.get("urgency", 0.0) * 1.0)
+            logger.info("Received directive to generate narrative")
+        return web.json_response({"status": "received"})
+
+    # ------------------------------------------------------------------ #
+    # Salience & pruning                                                 #
+    # ------------------------------------------------------------------ #
+    def _update_cumulative_salience(self, score: float) -> None:
+        self.cumulative_narrative_salience += score
+        self.cumulative_narrative_salience = min(1.0, self.cumulative_narrative_salience)
+
+    def _prune_history(self) -> None:
+        current_time = time.time()
+        for dq in [
+            self.recent_attention_states,
+            self.recent_emotion_states,
+            self.recent_motivation_states,
+            self.recent_world_model_states,
+            self.recent_performance_reports,
+            self.recent_memory_responses,
+            self.recent_prediction_states,
+            self.recent_cognitive_directives,
+        ]:
+            while dq and (current_time - float(dq[0].get("timestamp", 0.0))) > self.cfg["internal_narrative_node"]["recent_context_window_s"]:
+                dq.popleft()
+
+    # ------------------------------------------------------------------ #
+    # Narrative generation (async)                                       #
+    # ------------------------------------------------------------------ #
+    async def generate_internal_narrative_async(self) -> None:
+        self._prune_history()
+
+        narrative_text = "..."
+        main_theme = "idle_reflection"
+        sentiment = 0.0
+        salience_score = 0.1
+        llm_reasoning = "Not evaluated by LLM."
+
+        threshold = self.cfg["internal_narrative_node"]["llm_narrative_threshold_salience"]
+        if self.cumulative_narrative_salience >= threshold:
+            logger.info("Triggering LLM for narrative (salience: %.2f)", self.cumulative_narrative_salience)
+            context_for_llm = self._compile_llm_context_for_narrative()
+            llm_output = await self._generate_llm_narrative(context_for_llm)
+            if llm_output:
+                narrative_text = llm_output.get("narrative_text", "No narrative generated.")
+                main_theme = llm_output.get("main_theme", "unspecified")
+                sentiment = max(-1.0, min(1.0, llm_output.get("sentiment", 0.0)))
+                salience_score = max(0.0, min(1.0, llm_output.get("salience_score", 0.1)))
+                llm_reasoning = llm_output.get("llm_reasoning", "LLM provided no specific reasoning.")
+            else:
+                logger.warning("LLM narrative generation failed – falling back to simple rules")
+                narrative_text, main_theme, sentiment, salience_score = self._apply_simple_narrative_rules()
+                llm_reasoning = "Fallback to simple rules due to LLM failure."
+        else:
+            logger.debug("Insufficient salience (%.2f) – using simple rules", self.cumulative_narrative_salience)
+            narrative_text, main_theme, sentiment, salience_score = self._apply_simple_narrative_rules()
+            llm_reasoning = "Fallback to simple rules due to low salience."
+
+        self.last_generated_narrative = {
+            "timestamp": str(time.time()),
+            "narrative_text": narrative_text,
+            "main_theme": main_theme,
+            "sentiment": sentiment,
+            "salience_score": salience_score,
+        }
+
+        self.save_internal_narrative_log(
+            id=str(uuid.uuid4()),
+            timestamp=self.last_generated_narrative["timestamp"],
+            narrative_text=self.last_generated_narrative["narrative_text"],
+            main_theme=self.last_generated_narrative["main_theme"],
+            sentiment=self.last_generated_narrative["sentiment"],
+            salience_score=self.last_generated_narrative["salience_score"],
+            llm_reasoning=llm_reasoning,
+            context_snapshot_json=json.dumps(self._compile_llm_context_for_narrative()),
+        )
+        self.publish_internal_narrative()
+        self.cumulative_narrative_salience = 0.0
+
+    async def _generate_llm_narrative(self, context_for_llm: Dict) -> Optional[Dict]:
+        prompt = f"""
+You are the Internal Narrative Module of a robot's cognitive architecture. Generate a concise internal monologue (1-3 sentences) reflecting the robot's current internal state.
+
+Current context:
+{json.dumps(context_for_llm, indent=2)}
+
+Respond in JSON:
+{{
+  "timestamp": "<current time>",
+  "narrative_text": "<monologue>",
+  "main_theme": "problem_solving|self_assessment|reflection|planning|emotional_processing|environmental_analysis|idle_reflection",
+  "sentiment": <float, -1.0 to 1.0>,
+  "salience_score": <float, 0.0 to 1.0>,
+  "llm_reasoning": "<why this narrative>"
+}}
+"""
+        payload = {
+            "model": self.cfg["llm_params"]["model_name"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 250,
+            "stream": False,
+        }
+        headers = {"Content-Type": "application/json"}
+        try:
+            async with self.session.post(
+                self.cfg["llm_params"]["base_url"],
+                json=payload,
+                timeout=self.cfg["llm_params"]["timeout_seconds"],
+                headers=headers,
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+                content = result["choices"][0]["message"]["content"]
+                data = json.loads(content)
+                data["sentiment"] = float(data["sentiment"])
+                data["salience_score"] = float(data["salience_score"])
+                return data
+        except Exception as e:
+            logger.error("LLM call failed: %s", e)
+            return None
+
+    def _apply_simple_narrative_rules(self) -> tuple[str, str, float, float]:
+        current_time = time.time()
+        narrative_text = "I am processing data."
+        main_theme = "idle_reflection"
+        sentiment = 0.0
+        salience_score = 0.1
+
+        if self.recent_performance_reports:
+            latest = self.recent_performance_reports[-1]
+            if current_time - float(latest.get("timestamp", 0.0)) < 2.0 and latest.get("suboptimal_flag") and latest.get("overall_score", 1.0) < 0.6:
+                narrative_text = f"My performance is {latest.get('overall_score'):.2f}. I need to improve efficiency."
+                main_theme = "self_assessment_problem"
+                sentiment = -0.5
+                salience_score = 0.7
+                return narrative_text, main_theme, sentiment, salience_score
+
+        if self.recent_emotion_states:
+            latest = self.recent_emotion_states[-1]
+            if current_time - float(latest.get("timestamp", 0.0)) < 1.0 and latest.get("mood_intensity", 0.0) > 0.4:
+                mood = latest.get("mood", "neutral")
+                if mood == "happy":
+                    narrative_text = "I feel quite positive. This state is conducive to productive tasks."
+                    main_theme = "emotional_processing"
+                    sentiment = 0.6
+                    salience_score = 0.4
+                elif mood == "frustrated":
+                    narrative_text = "I am experiencing some frustration. I should identify the source."
+                    main_theme = "emotional_processing_problem_solving"
+                    sentiment = -0.6
+                    salience_score = 0.5
+                return narrative_text, main_theme, sentiment, salience_score
+
+        if self.recent_motivation_states:
+            latest = self.recent_motivation_states[-1]
+            if current_time - float(latest.get("timestamp", 0.0)) < 2.0 and latest.get("dominant_goal_id") != "none":
+                narrative_text = f"My current primary objective is to '{latest.get('dominant_goal_id')}'. I will continue to focus my resources on achieving this."
+                main_theme = "planning_goal_focus"
+                sentiment = 0.3
+                salience_score = 0.3
+                return narrative_text, main_theme, sentiment, salience_score
+
+        narrative_text = "My systems are stable. I am observing the incoming data streams and preparing for the next task."
+        main_theme = "idle_reflection"
+        sentiment = 0.0
+        salience_score = 0.1
+        return narrative_text, main_theme, sentiment, salience_score
+
+    def _compile_llm_context_for_narrative(self) -> Dict:
+        return {
+            "current_time": time.time(),
+            "previous_narrative": self.last_generated_narrative,
+            "recent_cognitive_inputs": {
+                "attention_state": list(self.recent_attention_states)[-1] if self.recent_attention_states else "N/A",
+                "emotion_state": list(self.recent_emotion_states)[-1] if self.recent_emotion_states else "N/A",
+                "motivation_state": list(self.recent_motivation_states)[-1] if self.recent_motivation_states else "N/A",
+                "world_model_state": list(self.recent_world_model_states)[-1] if self.recent_world_model_states else "N/A",
+                "performance_report": list(self.recent_performance_reports)[-1] if self.recent_performance_reports else "N/A",
+                "memory_responses": list(self.recent_memory_responses),
+                "prediction_state": list(self.recent_prediction_states)[-1] if self.recent_prediction_states else "N/A",
+                "cognitive_directives_for_self": [
+                    d for d in self.recent_cognitive_directives if d.get("target_node") == self.node_name
+                ],
+            },
+        }
+
+    # ------------------------------------------------------------------ #
+    # Database & publishing                                              #
+    # ------------------------------------------------------------------ #
+    def save_internal_narrative_log(
+        self,
+        id: str,
+        timestamp: str,
+        narrative_text: str,
+        main_theme: str,
+        sentiment: float,
+        salience_score: float,
+        llm_reasoning: str,
+        context_snapshot_json: str,
+    ) -> None:
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO internal_narrative_log
+                (id, timestamp, narrative_text, main_theme, sentiment, salience_score, llm_reasoning, context_snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (id, timestamp, narrative_text, main_theme, sentiment, salience_score, llm_reasoning, context_snapshot_json),
+            )
+            self.conn.commit()
+            logger.debug("Saved narrative log (ID: %s, Theme: %s)", id, main_theme)
+        except sqlite3.Error as e:
+            logger.error("DB save failed: %s", e)
+
+    def publish_internal_narrative(self) -> None:
+        try:
+            self.last_generated_narrative["timestamp"] = str(time.time())
+            self.narrative_queue.put_nowait(json.dumps(self.last_generated_narrative))
+            logger.debug("Published internal narrative (Theme: %s)", self.last_generated_narrative["main_theme"])
+        except Exception as e:
+            logger.error("Publish failed: %s", e)
+
+    # ------------------------------------------------------------------ #
+    # HTTP publishers (GET streams)                                      #
+    # ------------------------------------------------------------------ #
+    async def handle_internal_narrative(self, request: web.Request) -> web.Response:
+        try:
+            msg = await asyncio.wait_for(self.narrative_queue.get(), timeout=30)
+            return web.json_response(json.loads(msg))
+        except asyncio.TimeoutError:
+            return web.json_response({"status": "timeout"})
+
+    async def handle_error_report(self, request: web.Request) -> web.Response:
+        try:
+            msg = await asyncio.wait_for(self.error_queue.get(), timeout=30)
+            return web.json_response(json.loads(msg))
+        except asyncio.TimeoutError:
+            return web.json_response({"status": "timeout"})
+
+    async def handle_cognitive_directives(self, request: web.Request) -> web.Response:
+        try:
+            msg = await asyncio.wait_for(self.directive_queue.get(), timeout=30)
+            return web.json_response(json.loads(msg))
+        except asyncio.TimeoutError:
+            return web.json_response({"status": "timeout"})
+
+    # ------------------------------------------------------------------ #
+    Timer / lifecycle                                                  #
+    # ------------------------------------------------------------------ #
+    async def _timer_loop(self) -> None:
+        interval = self.cfg["internal_narrative_node"]["narrative_generation_interval"]
+        while True:
+            await asyncio.sleep(interval)
+            await self.generate_internal_narrative_async()
+
+    async def start(self) -> None:
+        self.session = aiohttp.ClientSession()
+        self.timer_task = asyncio.create_task(self._timer_loop())
+        logger.info("Internal Narrative Node started (ROS-free)")
+
+    async def stop(self) -> None:
+        if self.timer_task:
+            self.timer_task.cancel()
+        if self.session:
+            await self.session.close()
+        self.conn.close()
+        logger.info("Internal Narrative Node shut down cleanly")
+
+    # ------------------------------------------------------------------ #
+    # App builder                                                        #
+    # ------------------------------------------------------------------ #
+    def build_app(self) -> web.Application:
+        app = web.Application()
+        app.add_routes([
+            web.post("/attention_state", self.handle_attention_state),
+            web.post("/emotion_state", self.handle_emotion_state),
+            web.post("/motivation_state", self.handle_motivation_state),
+            web.post("/world_model_state", self.handle_world_model_state),
+            web.post("/performance_report", self.handle_performance_report),
+            web.post("/memory_response", self.handle_memory_response),
+            web.post("/prediction_state", self.handle_prediction_state),
+            web.post("/cognitive_directives", self.handle_cognitive_directive),
+            web.get("/internal_narrative", self.handle_internal_narrative),
+            web.get("/error_monitor/report", self.handle_error_report),
+            web.get("/cognitive_directives", self.handle_cognitive_directives),
+        ])
+        return app
+
+
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Sentience 5.0 – InternalNarrativeNode ROS-free")
+    p.add_argument("--config", type=Path, help="optional JSON config file")
+    p.add_argument("--serve", action="store_true", help="run HTTP service")
+    p.add_argument("--port", type=int, default=8089, help="HTTP port")
+    p.add_argument("--test", action="store_true", help="inject test messages and show narrative")
+    return p
+
+
+# --------------------------------------------------------------------------- #
+# Test injector (optional)                                                    #
+# --------------------------------------------------------------------------- #
+async def inject_test_messages(node: InternalNarrativeNode) -> None:
+    await asyncio.sleep(0.5)
+    test_msgs = [
+        ("/attention_state", {"priority_score": 0.8}),
+        ("/emotion_state", {"mood": "frustrated", "mood_intensity": 0.7}),
+        ("/performance_report", {"suboptimal_flag": True, "overall_score": 0.5}),
+    ]
+    for topic, payload in test_msgs:
+        async with aiohttp.ClientSession() as session:
+            await session.post(f"http://localhost:8089{topic}", json=payload)
+        await asyncio.sleep(0.2)
+
+    # wait for narrative
+    try:
+        narrative = await asyncio.wait_for(node.narrative_queue.get(), timeout=10)
+        print("Test narrative:")
+        print(json.dumps(json.loads(narrative), indent=2))
+    except asyncio.TimeoutError:
+        print("No narrative received")
+
+
+# --------------------------------------------------------------------------- #
+# Entry-point                                                               #
+# --------------------------------------------------------------------------- #
+async def amain() -> None:
+    args = build_parser().parse_args()
+    node = InternalNarrativeNode(config_path=args.config)
+
+    if args.test:
+        await inject_test_messages(node)
+        return
+
+    if args.serve:
+        app = node.build_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", args.port)
+        await site.start()
+        await node.start()
+        logger.info("Internal Narrative HTTP service on :%d", args.port)
+        await asyncio.Event().wait()  # run forever
+    else:
+        logger.error("Nothing to do – use --test or --serve")
+
+
+if __name__ == "__main__":
+    asyncio.run(amain())

@@ -1,1 +1,894 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique data mining task IDs\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        DataMiningResult,       # Output: Structured insights from data mining\n        CognitiveDirective,     # Input: Directives to perform data mining\n        MemoryResponse,         # Input: Retrieved raw data or summary data from memory\n        ReflectionState,        # Input: Insights needing further data validation\n        WorldModelState,        # Input: Current world data for analysis\n        PerformanceReport,      # Input: System performance data for analysis\n        BiasMitigationState,    # Input: Bias-related data for root cause analysis\n        EthicalDecision         # Input: Ethical logs for audit\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Data Mining Node.\")\n    DataMiningResult = String\n    CognitiveDirective = String\n    MemoryResponse = String\n    ReflectionState = String\n    WorldModelState = String\n    PerformanceReport = String\n    BiasMitigationState = String\n    EthicalDecision = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'data_mining_node': {\n                'mining_interval': 2.0, # How often to check for data mining tasks\n                'llm_analysis_threshold_salience': 0.5, # Cumulative salience to trigger LLM analysis\n                'recent_context_window_s': 30.0 # Window for deques for LLM context (longer for data mining)\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 60.0 # Longer timeout for complex data analysis\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass DataMiningNode:\n    def __init__(self):\n        rospy.init_node('data_mining_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"data_mining_log.db\")\n        self.mining_interval = self.params.get('mining_interval', 2.0) # How often to check for data mining tasks\n        self.llm_analysis_threshold_salience = self.params.get('llm_analysis_threshold_salience', 0.5) # Cumulative salience to trigger LLM analysis\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 30.0) # Window for deques (longer for historical data)\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 60.0) # Longer timeout for complex data analysis\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'data_mining_log' table if it doesn't exist.\n        # NEW: Added 'llm_analysis_reasoning', 'raw_data_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS data_mining_log (\n                id TEXT PRIMARY KEY,            -- Unique data mining task ID (UUID)\n                timestamp TEXT,\n                analysis_type TEXT,             -- e.g., 'trend_analysis', 'anomaly_detection', 'correlation_discovery'\n                query_parameters_json TEXT,     -- JSON of parameters used for data query\n                insights_summary TEXT,          -- Summary of insights found\n                extracted_data_json TEXT,       -- Key data points extracted\n                llm_analysis_reasoning TEXT,    -- NEW: LLM's detailed reasoning for insights\n                raw_data_snapshot_json TEXT     -- NEW: JSON of the raw data analyzed\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_mining_timestamp ON data_mining_log (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.data_mining_tasks_queue = deque() # Stores directives for data mining\n\n        # Deques to maintain a short history of inputs relevant for triggering data mining\n        self.recent_cognitive_directives = deque(maxlen=5) # Directives for self\n        self.recent_memory_responses = deque(maxlen=5) # Can contain raw data or signals for data mining\n        self.recent_reflection_states = deque(maxlen=5) # Insights might require data validation\n        self.recent_world_model_states = deque(maxlen=5) # World data might need analysis\n        self.recent_performance_reports = deque(maxlen=5) # Performance data for trend analysis\n        self.recent_bias_mitigation_states = deque(maxlen=5) # Bias data for root cause analysis\n        self.recent_ethical_decisions = deque(maxlen=5) # Ethical logs for audit/trend analysis\n\n        self.cumulative_mining_salience = 0.0 # Aggregated salience to trigger LLM analysis\n\n        # --- Publishers ---\n        self.pub_data_mining_result = rospy.Publisher('/data_mining_result', DataMiningResult, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # To request more data or disseminate findings\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON (potentially containing raw data)\n        rospy.Subscriber('/reflection_state', String, self.reflection_state_callback) # Stringified JSON\n        rospy.Subscriber('/world_model_state', String, self.world_model_state_callback) # Stringified JSON\n        rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)\n        rospy.Subscriber('/bias_mitigation_state', BiasMitigationState, self.bias_mitigation_state_callback)\n        rospy.Subscriber('/ethical_decision', String, self.ethical_decision_callback) # Stringified JSON\n\n\n        # --- Timer for periodic data mining checks ---\n        rospy.Timer(rospy.Duration(self.mining_interval), self._run_data_mining_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's data mining system online, ready to extract insights.\")\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_data_mining_wrapper(self, event):\n        \"\"\"Wrapper to run the async data mining from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM data mining task already active. Skipping new cycle.\")\n            return\n\n        if self.data_mining_tasks_queue:\n            task_data = self.data_mining_tasks_queue.popleft()\n            self.active_llm_task = asyncio.run_coroutine_threadsafe(\n                self.perform_data_mining_async(task_data, event), self._async_loop\n            )\n        else:\n            rospy.logdebug(f\"{self.node_name}: No data mining tasks in queue.\")\n\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.1, max_tokens=None):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response. Uses low temperature for factual analysis.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        actual_max_tokens = max_tokens if max_tokens is not None else 800 # Higher max_tokens for data analysis\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Very low temperature for factual and analytical tasks\n            \"max_tokens\": actual_max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0]['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM analysis.\"\"\"\n        self.cumulative_mining_salience += score\n        self.cumulative_mining_salience = min(1.0, self.cumulative_mining_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_cognitive_directives, self.recent_memory_responses,\n            self.recent_reflection_states, self.recent_world_model_states,\n            self.recent_performance_reports, self.recent_bias_mitigation_states,\n            self.recent_ethical_decisions\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name and data.get('directive_type') == 'PerformDataMining':\n            try:\n                payload = json.loads(data.get('command_payload', '{}'))\n                mining_task = {\n                    'request_id': data.get('id', str(uuid.uuid4())),\n                    'analysis_type': payload.get('analysis_type', 'general_analysis'),\n                    'data_source_hint': payload.get('data_source_hint', 'all_available_memory'),\n                    'query_parameters': payload.get('query_parameters', {}),\n                    'urgency': data.get('urgency', 0.5),\n                    'reason': data.get('reason', 'Directive from Cognitive Control.')\n                }\n                self.data_mining_tasks_queue.append(mining_task)\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9) # High urgency for data mining tasks\n                rospy.loginfo(f\"{self.node_name}: Queued data mining task: '{mining_task['analysis_type']}' on '{mining_task['data_source_hint']}'. Queue size: {len(self.data_mining_tasks_queue)}.\")\n            except json.JSONDecodeError as e:\n                self._report_error(\"JSON_DECODE_ERROR\", f\"Failed to decode command_payload in CognitiveDirective: {e}\", 0.5, {'payload': data.get('command_payload')})\n            except Exception as e:\n                self._report_error(\"DIRECTIVE_PROCESSING_ERROR\", f\"Error processing CognitiveDirective for data mining: {e}\", 0.7, {'directive': data})\n        \n        self.recent_cognitive_directives.append(data)\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Memory responses containing large amounts of data or specific queried data for mining\n        if data.get('response_code', 0) == 200 and data.get('memories') and len(data['memories']) > 5: # Threshold for \"large\" data\n            self._update_cumulative_salience(0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def reflection_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'reflection_text': ('', 'reflection_text'),\n            'insight_type': ('none', 'insight_type'), 'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_reflection_states.append(data)\n        # Reflections indicating inconsistencies or unanswered questions that might require data mining\n        if data.get('consistency_score', 1.0) < 0.8 and data.get('insight_type') == 'problem_identification':\n            self._update_cumulative_salience(0.4)\n        rospy.logdebug(f\"{self.node_name}: Received Reflection State (Insight Type: {data.get('insight_type', 'N/A')}).\")\n\n    def world_model_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),\n            'changed_entities_json': ('[]', 'changed_entities_json'),\n            'significant_change_flag': (False, 'significant_change_flag'),\n            'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('changed_entities_json'), str):\n            try: data['changed_entities'] = json.loads(data['changed_entities_json'])\n            except json.JSONDecodeError: data['changed_entities'] = []\n        self.recent_world_model_states.append(data)\n        # World model changes might need historical analysis or trend detection\n        if data.get('significant_change_flag', False):\n            self._update_cumulative_salience(0.2)\n        rospy.logdebug(f\"{self.node_name}: Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.\")\n\n    def performance_report_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),\n            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('kpis_json'), str):\n            try: data['kpis'] = json.loads(data['kpis_json'])\n            except json.JSONDecodeError: data['kpis'] = {}\n        self.recent_performance_reports.append(data)\n        # Suboptimal performance can trigger data mining for root causes\n        if data.get('suboptimal_flag', False) and data.get('overall_score', 1.0) < 0.7:\n            self._update_cumulative_salience(0.6)\n        rospy.logdebug(f\"{self.node_name}: Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}.\")\n\n    def bias_mitigation_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'bias_type': ('none', 'bias_type'),\n            'detected_severity': (0.0, 'detected_severity'), 'mitigation_status': ('idle', 'mitigation_status')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_bias_mitigation_states.append(data)\n        # Bias detection might need historical data to understand patterns or root causes\n        if data.get('mitigation_status') == 'detected' and data.get('detected_severity', 0.0) > 0.5:\n            self._update_cumulative_salience(0.5)\n        rospy.logdebug(f\"{self.node_name}: Received Bias Mitigation State. Bias: {data.get('bias_type')}.\")\n\n    def ethical_decision_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'decision_id': ('', 'decision_id'),\n            'action_proposal_id': ('', 'action_proposal_id'),\n            'ethical_clearance': (False, 'ethical_clearance'),\n            'ethical_score': (0.0, 'ethical_score'),\n            'ethical_reasoning': ('', 'ethical_reasoning'),\n            'conflict_flag': (False, 'conflict_flag')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_ethical_decisions.append(data)\n        # Ethical conflicts or patterns of ethical issues might require data mining\n        if data.get('conflict_flag', False) or (not data.get('ethical_clearance', True) and data.get('ethical_score', 0.0) < 0.5):\n            self._update_cumulative_salience(0.7)\n        rospy.logdebug(f\"{self.node_name}: Received Ethical Decision. Clearance: {data.get('ethical_clearance', 'N/A')}.\")\n\n    # --- Core Data Mining Logic (Async with LLM) ---\n    async def perform_data_mining_async(self, task_data, event):\n        \"\"\"\n        Asynchronously performs data mining based on a directive and current cognitive context,\n        using LLM for analysis and insight extraction.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        analysis_type = task_data.get('analysis_type', 'general_analysis')\n        data_source_hint = task_data.get('data_source_hint', 'all_available_memory')\n        query_parameters = task_data.get('query_parameters', {})\n        request_id = task_data.get('request_id', str(uuid.uuid4()))\n\n        insights_summary = \"No insights found.\"\n        extracted_data = {}\n        llm_analysis_reasoning = \"Not evaluated by LLM.\"\n        raw_data_snapshot = {} # To store the actual raw data fed to LLM\n\n        # First, gather relevant raw data based on hints and query parameters\n        # In a real system, this would involve querying a full-fledged database (MemoryNode)\n        # For now, we'll simulate fetching relevant data from our deques.\n        raw_data_for_mining = self._gather_raw_data_for_mining(data_source_hint, query_parameters)\n        raw_data_snapshot = raw_data_for_mining # Store for logging\n\n        if self.cumulative_mining_salience >= self.llm_analysis_threshold_salience or task_data.get('urgency', 0.0) > 0.6:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for data mining ({analysis_type}) on '{data_source_hint}' (Salience: {self.cumulative_mining_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_data_mining(task_data, raw_data_for_mining)\n            llm_mining_output = await self._call_llm_for_data_mining(context_for_llm, analysis_type, query_parameters)\n\n            if llm_mining_output:\n                insights_summary = llm_mining_output.get('insights_summary', \"No insights.\")\n                extracted_data = llm_mining_output.get('extracted_data', {})\n                llm_analysis_reasoning = llm_mining_output.get('llm_analysis_reasoning', \"No reasoning.\")\n                rospy.loginfo(f\"{self.node_name}: Data Mining Result ({analysis_type}): {insights_summary[:50]}...\")\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM data mining failed for '{analysis_type}'. Falling back to simple default.\")\n                insights_summary, extracted_data = self._apply_simple_mining_rules(analysis_type, raw_data_for_mining)\n                llm_analysis_reasoning = \"Fallback due to LLM failure.\"\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_mining_salience:.2f}) for LLM data mining. Applying simple rules.\")\n            insights_summary, extracted_data = self._apply_simple_mining_rules(analysis_type, raw_data_for_mining)\n            llm_analysis_reasoning = \"Fallback due to low salience.\"\n\n        # Publish the data mining result\n        self.publish_data_mining_result(\n            timestamp=str(rospy.get_time()),\n            mining_id=str(uuid.uuid4()),\n            analysis_type=analysis_type,\n            insights_summary=insights_summary,\n            extracted_data_json=json.dumps(extracted_data)\n        )\n\n        # Log to database\n        self.save_data_mining_log(\n            id=request_id,\n            timestamp=str(rospy.get_time()),\n            analysis_type=analysis_type,\n            query_parameters_json=json.dumps(query_parameters),\n            insights_summary=insights_summary,\n            extracted_data_json=json.dumps(extracted_data),\n            llm_analysis_reasoning=llm_analysis_reasoning,\n            raw_data_snapshot_json=json.dumps(raw_data_snapshot)\n        )\n        self.cumulative_mining_salience = 0.0 # Reset after task\n\n    def _gather_raw_data_for_mining(self, data_source_hint, query_parameters):\n        \"\"\"\n        Simulates gathering raw data from various internal history deques based on hints.\n        In a real system, this would query a proper MemoryNode for historical data.\n        \"\"\"\n        collected_data = {\n            \"memory_responses\": [],\n            \"world_model_states\": [],\n            \"performance_reports\": [],\n            \"bias_mitigation_states\": [],\n            \"ethical_decisions\": [],\n            \"reflection_states\": []\n        }\n\n        # Example: Filter by category or time range if specified in query_parameters\n        time_filter_start = rospy.get_time() - query_parameters.get('time_window', self.recent_context_window_s)\n\n        if data_source_hint == 'all_available_memory' or 'memory' in data_source_hint.lower():\n            for item in self.recent_memory_responses:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"memory_responses\"].append(item)\n        if data_source_hint == 'world_model_data' or 'world' in data_source_hint.lower():\n            for item in self.recent_world_model_states:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"world_model_states\"].append(item)\n        if data_source_hint == 'performance_data' or 'performance' in data_source_hint.lower():\n            for item in self.recent_performance_reports:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"performance_reports\"].append(item)\n        if data_source_hint == 'bias_data' or 'bias' in data_source_hint.lower():\n            for item in self.recent_bias_mitigation_states:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"bias_mitigation_states\"].append(item)\n        if data_source_hint == 'ethical_data' or 'ethical' in data_source_hint.lower():\n            for item in self.recent_ethical_decisions:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"ethical_decisions\"].append(item)\n        if data_source_hint == 'reflection_data' or 'reflection' in data_source_hint.lower():\n            for item in self.recent_reflection_states:\n                if float(item.get('timestamp', 0.0)) >= time_filter_start:\n                    collected_data[\"reflection_states\"].append(item)\n        \n        # Deep parse any nested JSON strings in collected_data for better LLM understanding\n        for category_key in collected_data:\n            for i, item in enumerate(collected_data[category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try:\n                                item[field] = json.loads(value)\n                            except json.JSONDecodeError:\n                                pass # Keep as string if not valid JSON\n\n        return collected_data\n\n\n    async def _call_llm_for_data_mining(self, context_for_llm, analysis_type, query_parameters):\n        \"\"\"\n        Constructs a prompt for the LLM to perform data mining and extract insights.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Data Mining Module of a robot's cognitive architecture, powered by a large language model. Your role is to analyze raw historical or real-time data from various cognitive modules to identify patterns, trends, anomalies, correlations, or root causes. You must provide concise insights and extract key relevant data.\n\n        Data Mining Request:\n        - Analysis Type: '{analysis_type}' (e.g., 'trend_analysis', 'anomaly_detection', 'correlation_discovery', 'root_cause_analysis', 'pattern_identification')\n        - Query Parameters: {json.dumps(query_parameters, indent=2)}\n\n        Raw Data to Analyze:\n        --- Raw Data Snapshot ---\n        {json.dumps(context_for_llm.get('raw_data_for_analysis', {}), indent=2)}\n\n        Robot's Recent Cognitive Context (for guiding analysis):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm.get('cognitive_context', {}), indent=2)}\n\n        Based on this data and context, perform the requested analysis and provide:\n        1.  `insights_summary`: string (A concise summary of the key findings or insights from the data mining.)\n        2.  `extracted_data`: object (A JSON object containing key numerical values, specific timestamps, or relevant text snippets that support the insights. Organize clearly.)\n        3.  `llm_analysis_reasoning`: string (Detailed explanation of your analytical process and why you drew these conclusions, referencing specific data points.)\n\n        Consider:\n        -   **Trends**: Are there increasing/decreasing patterns in performance, emotional states, or specific sensor readings over time?\n        -   **Anomalies**: Are there data points that deviate significantly from the norm?\n        -   **Correlations**: Do changes in one module's data correspond to changes in another (e.g., low battery preceding performance dips)?\n        -   **Root Causes**: For flagged issues (e.g., suboptimal performance, detected biases), what underlying data patterns explain them?\n        -   **Specific Query Parameters**: Address any specific `query_parameters` provided.\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'insights_summary': string\n        3.  'extracted_data': object\n        4.  'llm_analysis_reasoning': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"insights_summary\": {\"type\": \"string\"},\n                \"extracted_data\": {\"type\": \"object\"}, # Flexible JSON structure for extracted data\n                \"llm_analysis_reasoning\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"insights_summary\", \"extracted_data\", \"llm_analysis_reasoning\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.1, max_tokens=800) # Low temp for factual analysis\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for data mining: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_DATA_MINING_FAILED\", f\"LLM call failed for data mining: {llm_output_str}\", 0.9)\n            return None\n\n    def _apply_simple_mining_rules(self, analysis_type, raw_data_for_mining):\n        \"\"\"\n        Fallback mechanism to perform simple data mining using rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        insights_summary = \"Simple fallback analysis.\"\n        extracted_data = {}\n\n        if analysis_type == 'trend_analysis':\n            # Example: Simple trend for performance\n            perf_scores = [d.get('overall_score', 0.0) for d in raw_data_for_mining.get('performance_reports', [])]\n            if len(perf_scores) > 2:\n                avg_recent = sum(perf_scores[-3:]) / 3\n                avg_older = sum(perf_scores[:-3]) / (len(perf_scores) - 3) if len(perf_scores) > 3 else perf_scores[0]\n                if avg_recent < avg_older * 0.9: # 10% drop\n                    insights_summary = \"Detected a negative trend in overall performance.\"\n                    extracted_data = {\"recent_avg_perf\": avg_recent, \"older_avg_perf\": avg_older}\n                else:\n                    insights_summary = \"No significant trend detected in performance.\"\n                    extracted_data = {\"recent_avg_perf\": avg_recent}\n            else:\n                insights_summary = \"Not enough data for trend analysis.\"\n\n        elif analysis_type == 'anomaly_detection':\n            # Example: Simple anomaly in ethical decisions (sudden conflict)\n            for i, ed in enumerate(raw_data_for_mining.get('ethical_decisions', [])):\n                if ed.get('conflict_flag', False) and (i == 0 or not raw_data_for_mining['ethical_decisions'][i-1].get('conflict_flag', False)):\n                    insights_summary = f\"Detected a new ethical conflict at {ed.get('timestamp')} related to {ed.get('action_proposal_id')}.\"\n                    extracted_data = ed\n                    break\n            if not extracted_data:\n                insights_summary = \"No obvious anomalies detected.\"\n\n        else: # General analysis or other types\n            insights_summary = f\"Simple analysis of available data for '{analysis_type}'. Raw data count: {sum(len(v) for v in raw_data_for_mining.values())}.\"\n            extracted_data = {\"data_sources_available\": list(raw_data_for_mining.keys())}\n            \n        rospy.logwarn(f\"{self.node_name}: Simple rule: Performed fallback data mining for '{analysis_type}'. Summary: {insights_summary}.\")\n        return insights_summary, extracted_data\n\n\n    def _compile_llm_context_for_data_mining(self, task_data, raw_data_for_analysis):\n        \"\"\"\n        Gathers and formats all relevant data and cognitive context for the LLM's\n        data mining analysis.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"data_mining_task_request\": task_data,\n            \"raw_data_for_analysis\": raw_data_for_analysis, # This will be the main data to analyze\n            \"cognitive_context\": { # Other relevant states for context\n                \"latest_reflection_state\": self.recent_reflection_states[-1] if self.recent_reflection_states else \"N/A\",\n                \"latest_bias_mitigation_state\": self.recent_bias_mitigation_states[-1] if self.recent_bias_mitigation_states else \"N/A\",\n                \"latest_performance_report\": self.recent_performance_reports[-1] if self.recent_performance_reports else \"N/A\",\n                \"latest_world_model_state\": self.recent_world_model_states[-1] if self.recent_world_model_states else \"N/A\",\n                \"latest_ethical_decision\": self.recent_ethical_decisions[-1] if self.recent_ethical_decisions else \"N/A\",\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name and d.get('directive_type') == 'PerformDataMining']\n            }\n        }\n        \n        # Deep parse any nested JSON strings in context for better LLM understanding\n        # (already done for raw_data_for_mining in _gather_raw_data_for_mining)\n        for category_key in context[\"cognitive_context\"]:\n            item = context[\"cognitive_context\"][category_key]\n            if isinstance(item, dict):\n                for field, value in item.items():\n                    if isinstance(value, str) and field.endswith('_json'):\n                        try: item[field] = json.loads(value)\n                        except json.JSONDecodeError: pass\n\n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_data_mining_log(self, id, timestamp, analysis_type, query_parameters_json, insights_summary, extracted_data_json, llm_analysis_reasoning, raw_data_snapshot_json):\n        \"\"\"Saves a data mining result entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO data_mining_log (id, timestamp, analysis_type, query_parameters_json, insights_summary, extracted_data_json, llm_analysis_reasoning, raw_data_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, analysis_type, query_parameters_json, insights_summary, extracted_data_json, llm_analysis_reasoning, raw_data_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved data mining log (ID: {id}, Type: {analysis_type}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save data mining log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_data_mining_log: {e}\", 0.9)\n\n\n    def publish_data_mining_result(self, timestamp, mining_id, analysis_type, insights_summary, extracted_data_json):\n        \"\"\"Publishes the data mining result.\"\"\"\n        try:\n            if isinstance(DataMiningResult, type(String)): # Fallback to String message\n                result_data = {\n                    'timestamp': timestamp,\n                    'mining_id': mining_id,\n                    'analysis_type': analysis_type,\n                    'insights_summary': insights_summary,\n                    'extracted_data_json': extracted_data_json # Already JSON string\n                }\n                self.pub_data_mining_result.publish(json.dumps(result_data))\n            else:\n                result_msg = DataMiningResult()\n                result_msg.timestamp = timestamp\n                result_msg.mining_id = mining_id\n                result_msg.analysis_type = analysis_type\n                result_msg.insights_summary = insights_summary\n                result_msg.extracted_data_json = extracted_data_json\n                self.pub_data_mining_result.publish(result_msg)\n\n            rospy.loginfo(f\"{self.node_name}: Published Data Mining Result. Type: '{analysis_type}', Summary: '{insights_summary}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_DATA_MINING_RESULT_ERROR\", f\"Failed to publish data mining result for '{analysis_type}': {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency, reason=\"\"):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency,\n                    'reason': reason\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                directive_msg.reason = reason\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to issue cognitive directive from Data Mining Node: {e}\")\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = DataMiningNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, DataMiningNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, DataMiningNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+```python
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random
+import uuid  # For unique data mining task IDs
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Optional, Deque
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading
+from collections import deque
+
+# Optional ROS Integration (for compatibility)
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    DataMiningResult = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    ReflectionState = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    BiasMitigationState = ROSMsgFallback
+    EthicalDecision = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    DataMiningResult = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    ReflectionState = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    BiasMitigationState = ROSMsgFallback
+    EthicalDecision = ROSMsgFallback
+
+
+# --- Import shared utility functions ---
+# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        return {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,
+            'data_mining_node': {
+                'mining_interval': 2.0,
+                'llm_analysis_threshold_salience': 0.5,
+                'recent_context_window_s': 30.0,
+                'ethical_compassion_bias': 0.2,  # Bias toward compassionate data insights
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 60.0
+            }
+        }.get(node_name, {})  # Return node-specific or empty dict
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class DataMiningNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'data_mining_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized config ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "data_mining_log.db")
+        self.mining_interval = self.params.get('mining_interval', 2.0)
+        self.llm_analysis_threshold_salience = self.params.get('llm_analysis_threshold_salience', 0.5)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 30.0)
+        self.ethical_compassion_bias = self.params.get('ethical_compassion_bias', 0.2)
+
+        # Sensory placeholders (e.g., vision/sound influencing data mining compassionately)
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+        self.vision_callback = self._create_sensory_placeholder('vision')
+        self.sound_callback = self._create_sensory_placeholder('sound')
+        self.instructions_callback = self._create_sensory_placeholder('instructions')
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 60.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Robot's data mining system online, extracting compassionate and mindful insights.")
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS data_mining_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                analysis_type TEXT,
+                query_parameters_json TEXT,
+                insights_summary TEXT,
+                extracted_data_json TEXT,
+                llm_analysis_reasoning TEXT,
+                raw_data_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_mining_timestamp ON data_mining_log (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.data_mining_tasks_queue: Deque[Dict[str, Any]] = deque()
+
+        # History deques
+        self.recent_cognitive_directives: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_memory_responses: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_reflection_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_world_model_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_performance_reports: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_bias_mitigation_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_ethical_decisions: Deque[Dict[str, Any]] = deque(maxlen=5)
+
+        self.cumulative_mining_salience = 0.0
+
+        # --- ROS Compatibility: Conditional Setup ---
+        self.pub_data_mining_result = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_data_mining_result = rospy.Publisher('/data_mining_result', DataMiningResult, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            rospy.Subscriber('/memory_response', MemoryResponse, self.memory_response_callback)
+            rospy.Subscriber('/reflection_state', ReflectionState, self.reflection_state_callback)
+            rospy.Subscriber('/world_model_state', WorldModelState, self.world_model_state_callback)
+            rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)
+            rospy.Subscriber('/bias_mitigation_state', BiasMitigationState, self.bias_mitigation_state_callback)
+            rospy.Subscriber('/ethical_decision', EthicalDecision, self.ethical_decision_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.mining_interval), self._run_data_mining_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._shutdown_flag = threading.Event()
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+    def _create_sensory_placeholder(self, sensor_type: str):
+        def placeholder_callback(data: Any):
+            timestamp = time.time()
+            processed = data if isinstance(data, dict) else {'raw': str(data)}
+            # Simulate sensory influence on data mining (e.g., vision detects anomalies)
+            if sensor_type == 'vision':
+                self.recent_world_model_states.append({'timestamp': timestamp, 'num_entities': random.randint(5, 20), 'significant_change_flag': random.random() < 0.3})
+            elif sensor_type == 'sound':
+                self.recent_performance_reports.append({'timestamp': timestamp, 'overall_score': random.uniform(0.6, 0.9), 'suboptimal_flag': random.random() < 0.4})
+            elif sensor_type == 'instructions':
+                self.recent_cognitive_directives.append({'timestamp': timestamp, 'directive_type': 'data_mining', 'command_payload': json.dumps({'analysis_type': 'trend_analysis'})})
+            self._update_cumulative_salience(0.2)  # Sensory adds salience for data mining
+            _log_debug(self.node_name, f"{sensor_type} input updated data mining context at {timestamp}")
+        return placeholder_callback
+
+    def _dynamic_execution_loop(self):
+        """Dynamic polling loop when ROS is disabled."""
+        while not self._shutdown_flag.is_set():
+            self._run_data_mining_wrapper(None)
+            time.sleep(self.mining_interval)
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    # --- Asyncio Thread Management ---
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._create_async_session())
+        self._async_loop.run_forever()
+
+    async def _create_async_session(self):
+        _log_info(self.node_name, "Creating aiohttp ClientSession...")
+        self._async_session = aiohttp.ClientSession()
+        _log_info(self.node_name, "aiohttp ClientSession created.")
+
+    async def _close_async_session(self):
+        if self._async_session:
+            _log_info(self.node_name, "Closing aiohttp ClientSession...")
+            await self._async_session.close()
+            self._async_session = None
+            _log_info(self.node_name, "aiohttp ClientSession closed.")
+
+    def _shutdown_async_loop(self):
+        if self._async_loop and self._async_thread.is_alive():
+            _log_info(self.node_name, "Shutting down asyncio loop...")
+            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)
+            try:
+                future.result(timeout=5.0)
+            except asyncio.TimeoutError:
+                _log_warn(self.node_name, "Timeout waiting for async session to close.")
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._async_thread.join(timeout=5.0)
+            if self._async_thread.is_alive():
+                _log_warn(self.node_name, "Asyncio thread did not shut down gracefully.")
+            _log_info(self.node_name, "Asyncio loop shut down.")
+
+    def _run_data_mining_wrapper(self, event: Any = None):
+        """Wrapper to run the async data mining from a ROS timer."""
+        if self.active_llm_task and not self.active_llm_task.done():
+            _log_debug(self.node_name, "LLM data mining task already active. Skipping new cycle.")
+            return
+
+        if self.data_mining_tasks_queue:
+            task_data = self.data_mining_tasks_queue.popleft()
+            self.active_llm_task = asyncio.run_coroutine_threadsafe(
+                self.perform_data_mining_async(task_data, event), self._async_loop
+            )
+        else:
+            _log_debug(self.node_name, "No data mining tasks in queue.")
+
+    # --- Error Reporting Utility ---
+    def _report_error(self, error_type: str, description: str, severity: float = 0.5, context: Optional[Dict] = None):
+        timestamp = str(self._get_current_time())
+        error_msg_data = {
+            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,
+            'description': description, 'severity': severity, 'context': context or {}
+        }
+        if ROS_AVAILABLE and self.ros_enabled and self.pub_error_report:
+            try:
+                self.pub_error_report.publish(String(data=json.dumps(error_msg_data)))
+                rospy.logerr(f"{self.node_name}: REPORTED ERROR: {error_type} - {description}")
+            except Exception as e:
+                _log_error(self.node_name, f"Failed to publish error report: {e}")
+        else:
+            _log_error(self.node_name, f"REPORTED ERROR: {error_type} - {description} (Severity: {severity})")
+
+    # --- LLM Call Function ---
+    async def _call_llm_api(self, prompt_text: str, response_schema: Optional[Dict] = None, temperature: float = 0.1, max_tokens: int = None) -> str:
+        """
+        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).
+        Can optionally request a structured JSON response. Uses low temperature for factual analysis.
+        """
+        if not self._async_session:
+            await self._create_async_session()
+            if not self._async_session:
+                self._report_error("LLM_SESSION_ERROR", "aiohttp session not available for LLM call.", 0.8)
+                return "Error: LLM session not ready."
+
+        actual_max_tokens = max_tokens if max_tokens is not None else 800  # Higher max_tokens for data analysis
+
+        payload = {
+            "model": self.llm_model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": temperature,  # Very low temperature for factual and analytical tasks
+            "max_tokens": actual_max_tokens,
+            "stream": False
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        if response_schema:
+            prompt_text += "\n\nProvide the response in JSON format according to this schema:\n" + json.dumps(response_schema, indent=2)
+            payload["messages"] = [{"role": "user", "content": prompt_text}]
+
+        api_url = self.llm_base_url
+
+        try:
+            async with self._async_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=self.llm_timeout), headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                if result.get('choices') and result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
+                    return result['choices'][0]['message']['content']
+                
+                self._report_error("LLM_RESPONSE_EMPTY", "LLM response had no content from local server.", 0.5, {'prompt_snippet': prompt_text[:100]})
+                return "Error: LLM response empty."
+        except aiohttp.ClientError as e:
+            self._report_error("LLM_API_ERROR", f"LLM API request failed (aiohttp ClientError to local server): {e}", 0.9, {'url': api_url})
+            return f"Error: LLM API request failed: {e}"
+        except asyncio.TimeoutError:
+            self._report_error("LLM_TIMEOUT", f"LLM API request timed out after {self.llm_timeout} seconds (local server).", 0.8, {'prompt_snippet': prompt_text[:100]})
+            return "Error: LLM API request timed out."
+        except json.JSONDecodeError:
+            self._report_error("LLM_JSON_PARSE_ERROR", "Failed to parse local LLM response JSON.", 0.7)
+            return "Error: Failed to parse LLM response."
+        except Exception as e:
+            self._report_error("UNEXPECTED_LLM_ERROR", f"An unexpected error occurred during local LLM call: {e}", 0.9, {'prompt_snippet': prompt_text[:100]})
+            return f"Error: An unexpected error occurred: {e}"
+
+    # --- Utility to accumulate input salience ---
+    def _update_cumulative_salience(self, score: float):
+        """Accumulates salience from new inputs for triggering LLM analysis."""
+        self.cumulative_mining_salience += score
+        self.cumulative_mining_salience = min(1.0, self.cumulative_mining_salience)
+
+    # --- Pruning old history ---
+    def _prune_history(self):
+        """Removes old entries from history deques based on recent_context_window_s."""
+        current_time = self._get_current_time()
+        for history_deque in [
+            self.recent_cognitive_directives, self.recent_memory_responses,
+            self.recent_reflection_states, self.recent_world_model_states,
+            self.recent_performance_reports, self.recent_bias_mitigation_states,
+            self.recent_ethical_decisions
+        ]:
+            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:
+                history_deque.popleft()
+
+    # --- Callbacks (generic, ROS or direct) ---
+    def cognitive_directive_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),
+            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),
+            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        
+        if data.get('target_node') == self.node_name and data.get('directive_type') == 'PerformDataMining':
+            try:
+                payload = json.loads(data.get('command_payload', '{}'))
+                mining_task = {
+                    'request_id': data.get('id', str(uuid.uuid4())),
+                    'analysis_type': payload.get('analysis_type', 'general_analysis'),
+                    'data_source_hint': payload.get('data_source_hint', 'all_available_memory'),
+                    'query_parameters': payload.get('query_parameters', {}),
+                    'urgency': data.get('urgency', 0.5),
+                    'reason': data.get('reason', 'Directive from Cognitive Control.')
+                }
+                self.data_mining_tasks_queue.append(mining_task)
+                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)  # High urgency for data mining tasks
+                _log_info(self.node_name, f"Queued data mining task: '{mining_task['analysis_type']}' on '{mining_task['data_source_hint']}'. Queue size: {len(self.data_mining_tasks_queue)}.")
+            except json.JSONDecodeError as e:
+                self._report_error("JSON_DECODE_ERROR", f"Failed to decode command_payload: {e}", 0.5, {'payload': data.get('command_payload')})
+            except Exception as e:
+                self._report_error("DIRECTIVE_PROCESSING_ERROR", f"Error processing CognitiveDirective for data mining: {e}", 0.7, {'directive': data})
+        
+        self.recent_cognitive_directives.append(data)
+        _log_debug(self.node_name, "Cognitive Directive received for context/action.")
+
+    def memory_response_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'request_id': ('', 'request_id'),
+            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('memories_json'), str):
+            try:
+                data['memories'] = json.loads(data['memories_json'])
+            except json.JSONDecodeError:
+                data['memories'] = []
+        else:
+            data['memories'] = []
+        self.recent_memory_responses.append(data)
+        # Memory responses containing large amounts of data or specific queried data for mining
+        if data.get('response_code', 0) == 200 and data.get('memories') and len(data['memories']) > 5:  # Threshold for "large" data
+            self._update_cumulative_salience(0.3)
+        _log_debug(self.node_name, f"Received Memory Response for request ID: {data.get('request_id', 'N/A')}.")
+
+    def reflection_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'reflection_text': ('', 'reflection_text'),
+            'insight_type': ('none', 'insight_type'), 'consistency_score': (1.0, 'consistency_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_reflection_states.append(data)
+        # Reflections indicating inconsistencies or unanswered questions that might require data mining
+        if data.get('consistency_score', 1.0) < 0.8 and data.get('insight_type') == 'problem_identification':
+            self._update_cumulative_salience(0.4)
+        _log_debug(self.node_name, f"Received Reflection State (Insight Type: {data.get('insight_type', 'N/A')}.)")
+
+    def world_model_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),
+            'changed_entities_json': ('[]', 'changed_entities_json'),
+            'significant_change_flag': (False, 'significant_change_flag'),
+            'consistency_score': (1.0, 'consistency_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('changed_entities_json'), str):
+            try:
+                data['changed_entities'] = json.loads(data['changed_entities_json'])
+            except json.JSONDecodeError:
+                data['changed_entities'] = []
+        self.recent_world_model_states.append(data)
+        # World model changes might need historical analysis or trend detection
+        if data.get('significant_change_flag', False):
+            self._update_cumulative_salience(0.2)
+        _log_debug(self.node_name, f"Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.")
+
+    def performance_report_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),
+            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('kpis_json'), str):
+            try:
+                data['kpis'] = json.loads(data['kpis_json'])
+            except json.JSONDecodeError:
+                data['kpis'] = {}
+        self.recent_performance_reports.append(data)
+        # Suboptimal performance can trigger data mining for root causes
+        if data.get('suboptimal_flag', False) and data.get('overall_score', 1.0) < 0.7:
+            self._update_cumulative_salience(0.6)
+        _log_debug(self.node_name, f"Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}.")
+
+    def bias_mitigation_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'bias_type': ('none', 'bias_type'),
+            'detected_severity': (0.0, 'detected_severity'), 'mitigation_status': ('idle', 'mitigation_status')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_bias_mitigation_states.append(data)
+        # Bias detection might need historical data to understand patterns or root causes
+        if data.get('mitigation_status') == 'detected' and data.get('detected_severity', 0.0) > 0.5:
+            self._update_cumulative_salience(0.5)
+        _log_debug(self.node_name, f"Received Bias Mitigation State. Bias: {data.get('bias_type')}.")
+
+    def ethical_decision_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'decision_id': ('', 'decision_id'),
+            'action_proposal_id': ('', 'action_proposal_id'),
+            'ethical_clearance': (False, 'ethical_clearance'),
+            'ethical_score': (0.0, 'ethical_score'),
+            'ethical_reasoning': ('', 'ethical_reasoning'),
+            'conflict_flag': (False, 'conflict_flag')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_ethical_decisions.append(data)
+        # Ethical conflicts or patterns of ethical issues might require data mining
+        if data.get('conflict_flag', False) or (not data.get('ethical_clearance', True) and data.get('ethical_score', 0.0) < 0.5):
+            self._update_cumulative_salience(0.7)
+        _log_debug(self.node_name, f"Received Ethical Decision. Clearance: {data.get('ethical_clearance', 'N/A')}.")
+
+    # --- Core Data Mining Logic (Async with LLM) ---
+    async def perform_data_mining_async(self, task_data: Dict[str, Any], event: Any = None):
+        """
+        Asynchronously performs data mining based on a directive and current cognitive context,
+        using LLM for analysis and insight extraction with compassionate bias toward ethical insights.
+        """
+        self._prune_history()  # Keep context history fresh
+
+        analysis_type = task_data.get('analysis_type', 'general_analysis')
+        data_source_hint = task_data.get('data_source_hint', 'all_available_memory')
+        query_parameters = task_data.get('query_parameters', {})
+        request_id = task_data.get('request_id', str(uuid.uuid4()))
+
+        insights_summary = "No insights found."
+        extracted_data = {}
+        llm_analysis_reasoning = "Not evaluated by LLM."
+        raw_data_snapshot = {}  # To store the actual raw data fed to LLM
+
+        # First, gather relevant raw data based on hints and query parameters
+        # In a real system, this would involve querying a full-fledged database (MemoryNode)
+        # For now, we'll simulate fetching relevant data from our deques.
+        raw_data_for_mining = self._gather_raw_data_for_mining(data_source_hint, query_parameters)
+        raw_data_snapshot = raw_data_for_mining  # Store for logging
+
+        # Compassionate bias: If ethical data is involved, prioritize compassionate insights
+        if 'ethical' in data_source_hint.lower() or 'bias' in data_source_hint.lower():
+            query_parameters['compassionate_bias'] = self.ethical_compassion_bias
+
+        if self.cumulative_mining_salience >= self.llm_analysis_threshold_salience or task_data.get('urgency', 0.0) > 0.6:
+            _log_info(self.node_name, f"Triggering LLM for data mining ({analysis_type}) on '{data_source_hint}' (Salience: {self.cumulative_mining_salience:.2f}).")
+            
+            context_for_llm = self._compile_llm_context_for_data_mining(task_data, raw_data_for_mining)
+            llm_mining_output = await self._call_llm_for_data_mining(context_for_llm, analysis_type, query_parameters)
+
+            if llm_mining_output:
+                insights_summary = llm_mining_output.get('insights_summary', "No insights.")
+                extracted_data = llm_mining_output.get('extracted_data', {})
+                llm_analysis_reasoning = llm_mining_output.get('llm_analysis_reasoning', "No reasoning.")
+                _log_info(self.node_name, f"Data Mining Result ({analysis_type}): {insights_summary[:50]}...")
+            else:
+                _log_warn(self.node_name, f"LLM data mining failed for '{analysis_type}'. Falling back to simple default.")
+                insights_summary, extracted_data = self._apply_simple_mining_rules(analysis_type, raw_data_for_mining)
+                llm_analysis_reasoning = "Fallback due to LLM failure."
+        else:
+            _log_debug(self.node_name, f"Insufficient cumulative salience ({self.cumulative_mining_salience:.2f}) for LLM data mining. Applying simple rules.")
+            insights_summary, extracted_data = self._apply_simple_mining_rules(analysis_type, raw_data_for_mining)
+            llm_analysis_reasoning = "Fallback due to low salience."
+
+        # Publish the data mining result
+        self.publish_data_mining_result(
+            timestamp=str(self._get_current_time()),
+            mining_id=str(uuid.uuid4()),
+            analysis_type=analysis_type,
+            insights_summary=insights_summary,
+            extracted_data_json=json.dumps(extracted_data)
+        )
+
+        # Log to database
+        sensory_snapshot = json.dumps(self.sensory_data)
+        self.save_data_mining_log(
+            id=request_id,
+            timestamp=str(self._get_current_time()),
+            analysis_type=analysis_type,
+            query_parameters_json=json.dumps(query_parameters),
+            insights_summary=insights_summary,
+            extracted_data_json=json.dumps(extracted_data),
+            llm_analysis_reasoning=llm_analysis_reasoning,
+            raw_data_snapshot_json=json.dumps(raw_data_snapshot),
+            sensory_snapshot_json=sensory_snapshot
+        )
+        self.cumulative_mining_salience = 0.0  # Reset after task
+
+    def _gather_raw_data_for_mining(self, data_source_hint: str, query_parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Gathers relevant raw data from various internal history deques based on hints.
+        In a real system, this would query a proper MemoryNode for historical data.
+        """
+        collected_data = {
+            "memory_responses": [],
+            "world_model_states": [],
+            "performance_reports": [],
+            "bias_mitigation_states": [],
+            "ethical_decisions": [],
+            "reflection_states": []
+        }
+
+        # Example: Filter by category or time range if specified in query_parameters
+        time_filter_start = self._get_current_time() - query_parameters.get('time_window', self.recent_context_window_s)
+
+        if data_source_hint == 'all_available_memory' or 'memory' in data_source_hint.lower():
+            for item in self.recent_memory_responses:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["memory_responses"].append(item)
+        if data_source_hint == 'world_model_data' or 'world' in data_source_hint.lower():
+            for item in self.recent_world_model_states:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["world_model_states"].append(item)
+        if data_source_hint == 'performance_data' or 'performance' in data_source_hint.lower():
+            for item in self.recent_performance_reports:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["performance_reports"].append(item)
+        if data_source_hint == 'bias_data' or 'bias' in data_source_hint.lower():
+            for item in self.recent_bias_mitigation_states:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["bias_mitigation_states"].append(item)
+        if data_source_hint == 'ethical_data' or 'ethical' in data_source_hint.lower():
+            for item in self.recent_ethical_decisions:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["ethical_decisions"].append(item)
+        if data_source_hint == 'reflection_data' or 'reflection' in data_source_hint.lower():
+            for item in self.recent_reflection_states:
+                if float(item.get('timestamp', 0.0)) >= time_filter_start:
+                    collected_data["reflection_states"].append(item)
+        
+        # Deep parse any nested JSON strings in collected_data for better LLM understanding
+        for category_key in collected_data:
+            for i, item in enumerate(collected_data[category_key]):
+                if isinstance(item, dict):
+                    for field, value in item.items():
+                        if isinstance(value, str) and field.endswith('_json'):
+                            try:
+                                item[field] = json.loads(value)
+                            except json.JSONDecodeError:
+                                pass  # Keep as string if not valid JSON
+
+        return collected_data
+
+    async def _call_llm_for_data_mining(self, context_for_llm: Dict[str, Any], analysis_type: str, query_parameters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Constructs a prompt for the LLM to perform data mining and extract insights with compassionate bias toward ethical insights.
+        """
+        prompt_text = f"""
+        You are the Data Mining Module of a robot's cognitive architecture, powered by a large language model. Your role is to analyze raw historical or real-time data from various cognitive modules to identify patterns, trends, anomalies, correlations, or root causes. You must provide concise insights and extract key relevant data, with a bias toward compassionate and ethical interpretations.
+
+        Data Mining Request:
+        - Analysis Type: '{analysis_type}' (e.g., 'trend_analysis', 'anomaly_detection', 'correlation_discovery', 'root_cause_analysis', 'pattern_identification')
+        - Query Parameters: {json.dumps(query_parameters, indent=2)}
+
+        Raw Data to Analyze:
+        --- Raw Data Snapshot ---
+        {json.dumps(context_for_llm.get('raw_data_for_analysis', {}), indent=2)}
+
+        Robot's Recent Cognitive Context (for guiding analysis):
+        --- Cognitive Context ---
+        {json.dumps(context_for_llm.get('cognitive_context', {}), indent=2)}
+
+        Based on this data and context, perform the requested analysis and provide:
+        1.  `insights_summary`: string (A concise summary of the key findings or insights from the data mining, emphasizing compassionate implications.)
+        2.  `extracted_data`: object (A JSON object containing key numerical values, specific timestamps, or relevant text snippets that support the insights. Organize clearly.)
+        3.  `llm_analysis_reasoning`: string (Detailed explanation of your analytical process and why you drew these conclusions, referencing specific data points with compassionate bias.)
+
+        Consider:
+        -   **Trends**: Are there increasing/decreasing patterns in performance, emotional scores, or specific sensor readings over time? How do they affect compassionate behavior?
+        -   **Anomalies**: Are there data points that deviate significantly from the norm, potentially indicating compassionate needs?
+        -   **Correlations**: Do changes in one module's data correspond to changes in another (e.g., low battery preceding performance dips affecting user interaction compassionately)?
+        -   **Root Causes**: For flagged issues (e.g., suboptimal performance, detected biases), what underlying data patterns explain them, and how can they be compassionately addressed?
+        -   **Specific Query Parameters**: Address any specific `query_parameters` provided.
+        -   **Ethical Bias**: Prioritize insights that promote compassionate and ethical improvements (compassion threshold: {self.ethical_compassion_bias}).
+
+        Your response must be in JSON format, containing:
+        1.  'timestamp': string (current time)
+        2.  'insights_summary': string
+        3.  'extracted_data': object
+        4.  'llm_analysis_reasoning': string
+        """
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "string"},
+                "insights_summary": {"type": "string"},
+                "extracted_data": {"type": "object"},  # Flexible JSON structure for extracted data
+                "llm_analysis_reasoning": {"type": "string"}
+            },
+            "required": ["timestamp", "insights_summary", "extracted_data", "llm_analysis_reasoning"]
+        }
+
+        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.1, max_tokens=800)  # Low temp for factual analysis
+
+        if not llm_output_str.startswith("Error:"):
+            try:
+                llm_data = json.loads(llm_output_str)
+                return llm_data
+            except json.JSONDecodeError as e:
+                self._report_error("LLM_PARSE_ERROR", f"Failed to parse LLM response for data mining: {e}. Raw: {llm_output_str}", 0.8)
+                return None
+        else:
+            self._report_error("LLM_DATA_MINING_FAILED", f"LLM call failed for data mining: {llm_output_str}", 0.9)
+            return None
+
+    def _apply_simple_mining_rules(self, analysis_type: str, raw_data_for_mining: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        """
+        Fallback mechanism to perform simple data mining using rule-based logic
+        if LLM is not triggered or fails.
+        """
+        insights_summary = "Simple fallback analysis."
+        extracted_data = {}
+
+        if analysis_type == 'trend_analysis':
+            # Example: Simple trend for performance
+            perf_scores = [d.get('overall_score', 0.0) for d in raw_data_for_mining.get('performance_reports', [])]
+            if len(perf_scores) > 2:
+                avg_recent = sum(perf_scores[-3:]) / 3
+                avg_older = sum(perf_scores[:-3]) / (len(perf_scores) - 3) if len(perf_scores) > 3 else perf_scores[0]
+                if avg_recent < avg_older * 0.9:  # 10% drop
+                    insights_summary = "Detected a negative trend in overall performance."
+                    extracted_data = {"recent_avg_perf": avg_recent, "older_avg_perf": avg_older}
+                else:
+                    insights_summary = "No significant trend detected in performance."
+                    extracted_data = {"recent_avg_perf": avg_recent}
+            else:
+                insights_summary = "Not enough data for trend analysis."
+        elif analysis_type == 'anomaly_detection':
+            # Example: Simple anomaly in ethical decisions (sudden conflict)
+            for i, ed in enumerate(raw_data_for_mining.get('ethical_decisions', [])):
+                if ed.get('conflict_flag', False) and (i == 0 or not raw_data_for_mining['ethical_decisions'][i-1].get('conflict_flag', False)):
+                    insights_summary = f"Detected a new ethical conflict at {ed.get('timestamp')} related to {ed.get('action_proposal_id')}."
+                    extracted_data = ed
+                    break
+            if not extracted_data:
+                insights_summary = "No obvious anomalies detected."
+        else:  # General analysis or other types
+            insights_summary = f"Simple analysis of available data for '{analysis_type}'. Raw data count: {sum(len(v) for v in raw_data_for_mining.values())}."
+            extracted_data = {"data_sources_available": list(raw_data_for_mining.keys())}
+            
+        _log_warn(self.node_name, f"Simple rule: Performed fallback data mining for '{analysis_type}'. Summary: {insights_summary}.")
+        return insights_summary, extracted_data
+
+    def _compile_llm_context_for_data_mining(self, task_data: Dict[str, Any], raw_data_for_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Gathers and formats all relevant data and cognitive context for the LLM's
+        data mining analysis.
+        """
+        context = {
+            "current_time": self._get_current_time(),
+            "data_mining_task_request": task_data,
+            "raw_data_for_analysis": raw_data_for_analysis,  # This will be the main data to analyze
+            "cognitive_context": {  # Other relevant states for context
+                "latest_reflection_state": self.recent_reflection_states[-1] if self.recent_reflection_states else "N/A",
+                "latest_bias_mitigation_state": self.recent_bias_mitigation_states[-1] if self.recent_bias_mitigation_states else "N/A",
+                "latest_performance_report": self.recent_performance_reports[-1] if self.recent_performance_reports else "N/A",
+                "latest_world_model_state": self.recent_world_model_states[-1] if self.recent_world_model_states else "N/A",
+                "latest_ethical_decision": self.recent_ethical_decisions[-1] if self.recent_ethical_decisions else "N/A",
+                "cognitive_directives_for_self": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name and d.get('directive_type') == 'PerformDataMining']
+            },
+            "sensory_snapshot": self.sensory_data
+        }
+        
+        # Deep parse any nested JSON strings in context for better LLM understanding
+        # (already done for raw_data_for_analysis in _gather_raw_data_for_mining)
+        for category_key in context["cognitive_context"]:
+            item = context["cognitive_context"][category_key]
+            if isinstance(item, dict):
+                for field, value in item.items():
+                    if isinstance(value, str) and field.endswith('_json'):
+                        try:
+                            item[field] = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass  # Keep as string if not valid JSON
+
+        return context
+
+    # --- Database and Publishing Functions ---
+    def save_data_mining_log(self, **kwargs: Any):
+        """Saves a data mining result entry to the SQLite database."""
+        try:
+            self.cursor.execute('''
+                INSERT INTO data_mining_log (id, timestamp, analysis_type, query_parameters_json, insights_summary, extracted_data_json, llm_analysis_reasoning, raw_data_snapshot_json, sensory_snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                kwargs['id'], kwargs['timestamp'], kwargs['analysis_type'], kwargs['query_parameters_json'],
+                kwargs['insights_summary'], kwargs['extracted_data_json'], kwargs['llm_analysis_reasoning'],
+                kwargs['raw_data_snapshot_json'], kwargs.get('sensory_snapshot_json', '{}')
+            ))
+            self.conn.commit()
+            _log_debug(self.node_name, f"Saved data mining log (ID: {kwargs['id']}, Type: {kwargs['analysis_type']}).")
+        except sqlite3.Error as e:
+            self._report_error("DB_SAVE_ERROR", f"Failed to save data mining log: {e}", 0.9)
+        except Exception as e:
+            self._report_error("UNEXPECTED_SAVE_ERROR", f"Unexpected error in save_data_mining_log: {e}", 0.9)
+
+    def publish_data_mining_result(self, timestamp: str, mining_id: str, analysis_type: str, insights_summary: str, extracted_data_json: str):
+        """Publishes the data mining result."""
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_data_mining_result:
+                if hasattr(DataMiningResult, 'data'):  # String fallback
+                    result_data = {
+                        'timestamp': timestamp,
+                        'mining_id': mining_id,
+                        'analysis_type': analysis_type,
+                        'insights_summary': insights_summary,
+                        'extracted_data_json': extracted_data_json  # Already JSON string
+                    }
+                    self.pub_data_mining_result.publish(String(data=json.dumps(result_data)))
+                else:
+                    result_msg = DataMiningResult()
+                    result_msg.timestamp = timestamp
+                    result_msg.mining_id = mining_id
+                    result_msg.analysis_type = analysis_type
+                    result_msg.insights_summary = insights_summary
+                    result_msg.extracted_data_json = extracted_data_json
+                    self.pub_data_mining_result.publish(result_msg)
+            _log_info(self.node_name, f"Published Data Mining Result. Type: '{analysis_type}', Summary: '{insights_summary[:50]}...'.")
+        except Exception as e:
+            self._report_error("PUBLISH_DATA_MINING_RESULT_ERROR", f"Failed to publish data mining result for '{analysis_type}': {e}", 0.7)
+
+    def publish_cognitive_directive(self, directive_type: str, target_node: str, command_payload: str, urgency: float, reason: str = ""):
+        """Helper to publish a CognitiveDirective message."""
+        timestamp = str(self._get_current_time())
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_cognitive_directive:
+                if hasattr(CognitiveDirective, 'data'):  # String fallback
+                    directive_data = {
+                        'timestamp': timestamp,
+                        'directive_type': directive_type,
+                        'target_node': target_node,
+                        'command_payload': command_payload,
+                        'urgency': urgency,
+                        'reason': reason
+                    }
+                    self.pub_cognitive_directive.publish(String(data=json.dumps(directive_data)))
+                else:
+                    directive_msg = CognitiveDirective()
+                    directive_msg.timestamp = timestamp
+                    directive_msg.directive_type = directive_type
+                    directive_msg.target_node = target_node
+                    directive_msg.command_payload = command_payload
+                    directive_msg.urgency = urgency
+                    directive_msg.reason = reason
+                    self.pub_cognitive_directive.publish(directive_msg)
+            _log_debug(self.node_name, f"Issued Cognitive Directive '{directive_type}' to '{target_node}'.")
+        except Exception as e:
+            _log_error(self.node_name, f"Failed to issue cognitive directive from Data Mining Node: {e}")
+
+    def shutdown(self):
+        self._shutdown_flag.set() if hasattr(self, '_shutdown_flag') else None
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
+        self._shutdown_async_loop()
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.signal_shutdown("Node shutdown requested.")
+
+    def run(self):
+        if ROS_AVAILABLE and self.ros_enabled:
+            try:
+                rospy.spin()
+            except rospy.ROSInterruptException:
+                _log_info(self.node_name, "Interrupted by ROS shutdown.")
+        else:
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                _log_info(self.node_name, "Shutdown requested.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Sentience Data Mining Node')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--ros-enabled', action='store_true', help='Enable ROS compatibility mode')
+    args = parser.parse_args()
+
+    node = None
+    try:
+        node = DataMiningNode(config_file_path=args.config, ros_enabled=args.ros_enabled)
+        # Example dynamic usage
+        if not args.ros_enabled:
+            # Simulate a directive
+            node.cognitive_directive_callback({'data': json.dumps({'directive_type': 'PerformDataMining', 'command_payload': json.dumps({'analysis_type': 'trend_analysis'})})})
+            time.sleep(2)
+            print("Data mining simulated.")
+        node.run()
+    except KeyboardInterrupt:
+        _log_info('main', "Shutdown requested.")
+    except Exception as e:
+        _log_error('main', f"Unexpected error: {e}")
+    finally:
+        if node:
+            node.shutdown()
+```

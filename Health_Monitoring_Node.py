@@ -1,89 +1,42 @@
-import logging
-import json
-import rospy
-from typing import Dict, Optional
+#!/usr/bin/env python3
+"""
+Thin ROS shim around the stand-alone HealthMonitoringNode.
+"""
+import rospy, asyncio, threading, json
 from std_msgs.msg import String
-import psutil  # For system resource monitoring (install via pip if needed)
-import time
+from health_monitoring_node import HealthMonitoringNode, build_parser
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-class HealthMonitoringNode:
+class ROSHealthBridge:
     def __init__(self):
-        self.health_status: Dict = {
-            "cpu_usage": 0.0,
-            "memory_usage": 0.0,
-            "error_rate": 0.0,
-            "last_check": 0.0
-        }
-        self.error_count = 0
-        self.pub = rospy.Publisher("health_status", String, queue_size=10)
-        self.subscribers = {
-            "control": rospy.Subscriber("control_output", String, self.callback_control),
-            "monitoring": rospy.Subscriber("monitoring_output", String, self.callback_monitoring)
-        }
-        logger.info(f"{rospy.get_name()}: HealthMonitoringNode initialized")
+        rospy.init_node('health_monitoring_node')
+        args = build_parser().parse_args(rospy.myargv()[1:])
+        self.node = HealthMonitoringNode(args)
 
-    def callback_control(self, data: String) -> None:
-        """Callback to process control output for health assessment."""
-        try:
-            control_data = json.loads(data.data)
-            logger.info(f"{rospy.get_name()}: Received control data")
-            self.check_execution_health(control_data)
-        except Exception as e:
-            self.error_count += 1
-            logger.error(f"{rospy.get_name()}: Error processing control data: {e}")
+        # ROS pubs/subs
+        self.pub = rospy.Publisher(args.health_topic, String, queue_size=10)
+        rospy.Subscriber(args.control_topic,    String, self._on_control)
+        rospy.Subscriber(args.monitoring_topic, String, self._on_monitoring)
 
-    def callback_monitoring(self, data: String) -> None:
-        """Callback to process monitoring data for health assessment."""
-        try:
-            monitoring_data = json.loads(data.data)
-            logger.info(f"{rospy.get_name()}: Received monitoring data")
-            self.update_system_health(monitoring_data)
-        except Exception as e:
-            self.error_count += 1
-            logger.error(f"{rospy.get_name()}: Error processing monitoring data: {e}")
+        # async loop in thread
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_async, daemon=True)
+        self.thread.start()
 
-    def update_system_health(self, monitoring_data: Dict) -> None:
-        """Update system health metrics based on monitoring data."""
-        try:
-            if time.time() - self.health_status["last_check"] >= 5:  # Update every 5 seconds
-                self.health_status["cpu_usage"] = psutil.cpu_percent()
-                self.health_status["memory_usage"] = psutil.virtual_memory().percent
-                self.health_status["error_rate"] = (self.error_count / (time.time() - self.health_status["last_check"])) if self.health_status["last_check"] > 0 else 0.0
-                self.health_status["last_check"] = time.time()
-                logger.info(f"{rospy.get_name()}: Updated health status: {json.dumps(self.health_status)}")
-                self.publish_health_status()
-        except Exception as e:
-            logger.error(f"{rospy.get_name()}: Error updating system health: {e}")
+    def _on_control(self, msg):    self.loop.call_soon_threadsafe(self.node.control_queue.put_nowait, msg.data)
+    def _on_monitoring(self, msg): self.loop.call_soon_threadsafe(self.node.monitoring_queue.put_nowait, msg.data)
 
-    def check_execution_health(self, control_data: Dict) -> None:
-        """Check health based on control execution."""
-        try:
-            if control_data.get("action") == "idle" and time.time() - self.health_status["last_check"] > 60:
-                self.health_status["error_rate"] += 0.1  # Penalize prolonged idleness
-                logger.warning(f"{rospy.get_name()}: Prolonged idle state detected")
-            self.publish_health_status()
-        except Exception as e:
-            logger.error(f"{rospy.get_name()}: Error checking execution health: {e}")
+    def _run_async(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._async_forwarder())
 
-    def publish_health_status(self) -> None:
-        """Publish the current health status."""
-        try:
-            self.pub.publish(json.dumps(self.health_status))
-            logger.info(f"{rospy.get_name()}: Published health status: {json.dumps(self.health_status)}")
-        except Exception as e:
-            logger.error(f"{rospy.get_name()}: Error publishing health status: {e}")
+    async def _async_forwarder(self):
+        await self.node.start()
+        while not rospy.is_shutdown():
+            msg = await self.node.health_queue.get()
+            self.pub.publish(String(msg))
 
-    def run(self):
+    def spin(self):
         rospy.spin()
 
-if __name__ == "__main__":
-    try:
-        rospy.init_node("health_monitoring_node", anonymous=True)
-        node = HealthMonitoringNode()
-        node.run()
-    except Exception as e:
-        rospy.logerr(f"{rospy.get_name()}: Unexpected error: {e}")
+if __name__ == '__main__':
+    ROSHealthBridge().spin()

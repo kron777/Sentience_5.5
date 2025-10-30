@@ -1,1 +1,814 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique bias event IDs\nfrom collections import deque\n\n# --- NLP Imports (for initial text analysis, before LLM) ---\n# Assuming `transformers` is installed for basic sentiment analysis\nfrom transformers import pipeline\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        BiasMitigationState,    # Output: Status of bias detection and mitigation efforts\n        InternalNarrative,      # Input: Robot's internal thoughts (can reveal cognitive biases)\n        InteractionRequest,     # Input: User inputs (can carry user biases or trigger robot biases)\n        MemoryResponse,         # Input: Retrieved memories (can contain biased data)\n        ReflectionState,        # Input: Insights from self-reflection (can flag biases)\n        CognitiveDirective      # Input: Directives for bias audit or mitigation\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Bias Mitigation Node.\")\n    BiasMitigationState = String\n    InternalNarrative = String\n    InteractionRequest = String\n    MemoryResponse = String\n    ReflectionState = String\n    CognitiveDirective = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'bias_mitigation_node': {\n                'mitigation_interval': 1.0,\n                'llm_trigger_salience': 0.6,\n                'recent_context_window_s': 20.0\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 30.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass BiasMitigationNode:\n    def __init__(self):\n        # Initialize the ROS node with a unique name.\n        rospy.init_node('bias_mitigation_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"bias_log.db\")\n        self.mitigation_interval = self.params.get('mitigation_interval', 1.0) # How often to check for biases\n        self.llm_trigger_salience = self.params.get('llm_trigger_salience', 0.6) # Cumulative salience to trigger LLM analysis\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 20.0) # Window for deques for LLM context\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 30.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'bias_log' table if it doesn't exist.\n        # NEW: Added 'llm_reasoning', 'context_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS bias_log (\n                id TEXT PRIMARY KEY,            -- Unique bias detection event ID (UUID)\n                timestamp TEXT,\n                bias_type TEXT,                 -- e.g., 'confirmation_bias', 'anchoring_bias', 'automation_bias'\n                detected_severity REAL,         -- How severe the detected bias is (0.0 to 1.0)\n                mitigation_status TEXT,         -- 'none', 'detected', 'mitigated', 'monitor'\n                llm_reasoning TEXT,             -- NEW: LLM's detailed reasoning for detection/mitigation\n                context_snapshot_json TEXT      -- NEW: JSON of relevant cognitive context at time of inference\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_bias_timestamp ON bias_log (timestamp)')\n        self.conn.commit()\n\n        # --- Internal State ---\n        self.current_bias_mitigation_state = {\n            'timestamp': str(rospy.get_time()),\n            'bias_type': 'none',\n            'detected_severity': 0.0,\n            'mitigation_status': 'idle'\n        }\n        # self.sentiment_analyzer = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english') # Removed as LLM will handle all NLP\n\n        # Deques to maintain a short history of inputs relevant to bias detection\n        self.recent_internal_narratives = deque(maxlen=10)\n        self.recent_interaction_requests = deque(maxlen=10)\n        self.recent_memory_responses = deque(maxlen=5) # For biased memory retrieval\n        self.recent_reflection_states = deque(maxlen=5) # Insights can flag biases\n        self.recent_cognitive_directives = deque(maxlen=3) # Directives for bias audit/mitigation\n\n        self.cumulative_bias_salience = 0.0 # Aggregated salience to trigger LLM analysis\n\n        # --- Publishers ---\n        self.pub_bias_mitigation_state = rospy.Publisher('/bias_mitigation_state', BiasMitigationState, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # For issuing directives to other nodes for mitigation\n\n        # --- Subscribers ---\n        rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback) # Stringified JSON\n        rospy.Subscriber('/interaction_request', String, self.interaction_request_callback) # Stringified JSON\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n        rospy.Subscriber('/reflection_state', String, self.reflection_state_callback) # Stringified JSON\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n\n        # --- Timer for periodic bias checking ---\n        rospy.Timer(rospy.Duration(self.mitigation_interval), self._run_bias_analysis_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's bias mitigation system online.\")\n        # Publish initial state\n        self.publish_bias_mitigation_state(None)\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_bias_analysis_wrapper(self, event):\n        \"\"\"Wrapper to run the async bias analysis from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM bias analysis task already active. Skipping new cycle.\")\n            return\n        \n        # Schedule the async task\n        self.active_llm_task = asyncio.run_coroutine_threadsafe(\n            self.analyze_for_biases_async(event), self._async_loop\n        )\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.3, max_tokens=350):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Low temperature for factual/reasoning tasks (bias detection)\n            \"max_tokens\": max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0]['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM analysis.\"\"\"\n        self.cumulative_bias_salience += score\n        self.cumulative_bias_salience = min(1.0, self.cumulative_bias_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_internal_narratives, self.recent_interaction_requests,\n            self.recent_memory_responses, self.recent_reflection_states,\n            self.recent_cognitive_directives\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def internal_narrative_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'narrative_text': ('', 'narrative_text'),\n            'main_theme': ('', 'main_theme'), 'sentiment': (0.0, 'sentiment'), 'salience_score': (0.0, 'salience_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_internal_narratives.append(data)\n        # Narratives indicating strong internal convictions, quick conclusions, or emotional reasoning\n        if data.get('sentiment', 0.0) > 0.5 and \"conclusion\" in data.get('main_theme', '').lower() or \\\n           data.get('sentiment', 0.0) < -0.5 and \"problem\" in data.get('main_theme', '').lower():\n            self._update_cumulative_salience(data.get('salience_score', 0.0) * 0.4)\n        rospy.logdebug(f\"{self.node_name}: Received Internal Narrative (Theme: {data.get('main_theme', 'N/A')}).\")\n\n    def interaction_request_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'request_type': ('', 'request_type'), 'user_id': ('unknown', 'user_id'),\n            'command_payload': ('{}', 'command_payload'), 'urgency_score': (0.0, 'urgency_score'),\n            'speech_text': ('', 'speech_text'), 'gesture_data_json': ('{}', 'gesture_data_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('command_payload'), str):\n            try: data['command_payload'] = json.loads(data['command_payload'])\n            except json.JSONDecodeError: data['command_payload'] = {}\n        if isinstance(data.get('gesture_data_json'), str):\n            try: data['gesture_data'] = json.loads(data['gesture_data_json'])\n            except json.JSONDecodeError: data['gesture_data'] = {}\n        \n        self.recent_interaction_requests.append(data)\n        # User input with strong opinions, leading questions, or confirmation-seeking\n        if \"force\" in data.get('speech_text', '').lower() or \"only option\" in data.get('speech_text', '').lower():\n            self._update_cumulative_salience(data.get('urgency_score', 0.0) * 0.6)\n        rospy.logdebug(f\"{self.node_name}: Received Interaction Request (ID: {data.get('request_id', 'N/A')}).\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Memory retrieval that shows selective recall or over-reliance on certain past events\n        if data.get('memories') and len(data['memories']) > 1 and \\\n           any('strong_preference' in mem.get('category', '') for mem in data['memories']):\n            self._update_cumulative_salience(0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def reflection_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'reflection_text': ('', 'reflection_text'),\n            'insight_type': ('none', 'insight_type'), 'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_reflection_states.append(data)\n        # Self-reflection that flags inconsistencies or potential errors in reasoning\n        if data.get('consistency_score', 1.0) < 0.7:\n            self._update_cumulative_salience(0.5 * (1.0 - data['consistency_score']))\n        rospy.logdebug(f\"{self.node_name}: Received Reflection State (Insight Type: {data.get('insight_type', 'N/A')}).\")\n\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name:\n            self.recent_cognitive_directives.append(data) # Add directives for self to context\n            # Directives to perform a bias audit or apply a specific mitigation strategy\n            if data.get('directive_type') in ['AuditBias', 'ApplyMitigationStrategy']:\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)\n            rospy.loginfo(f\"{self.node_name}: Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}).\")\n        else:\n            self.recent_cognitive_directives.append(data) # Add all directives for general context\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n\n    # --- Core Bias Analysis Logic (Async with LLM) ---\n    async def analyze_for_biases_async(self, event):\n        \"\"\"\n        Asynchronously analyzes recent cognitive data for signs of bias using LLM.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        if self.cumulative_bias_salience >= self.llm_trigger_salience:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for bias analysis (Salience: {self.cumulative_bias_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_bias_analysis()\n            llm_bias_output = await self._detect_and_mitigate_bias_llm(context_for_llm)\n\n            if llm_bias_output:\n                bias_event_id = str(uuid.uuid4())\n                timestamp = llm_bias_output.get('timestamp', str(rospy.get_time()))\n                bias_type = llm_bias_output.get('bias_type', 'none')\n                detected_severity = max(0.0, min(1.0, llm_bias_output.get('detected_severity', 0.0)))\n                mitigation_status = llm_bias_output.get('mitigation_status', 'idle')\n                llm_reasoning = llm_bias_output.get('llm_reasoning', 'No reasoning.')\n                recommended_directive = llm_bias_output.get('recommended_directive', None)\n\n\n                self.current_bias_mitigation_state = {\n                    'timestamp': timestamp,\n                    'bias_type': bias_type,\n                    'detected_severity': detected_severity,\n                    'mitigation_status': mitigation_status\n                }\n\n                self.save_bias_log(\n                    id=bias_event_id,\n                    timestamp=timestamp,\n                    bias_type=bias_type,\n                    detected_severity=detected_severity,\n                    mitigation_status=mitigation_status,\n                    llm_reasoning=llm_reasoning,\n                    context_snapshot_json=json.dumps(context_for_llm)\n                )\n                self.publish_bias_mitigation_state(None) # Publish updated state\n\n                # If a directive is recommended, publish it for system-wide mitigation\n                if recommended_directive:\n                    self.publish_cognitive_directive(\n                        directive_type=recommended_directive.get('directive_type', 'ConsiderAlternative'),\n                        target_node=recommended_directive.get('target_node', 'CognitiveControl'), # Often directs Cognitive Control\n                        command_payload=json.dumps(recommended_directive.get('command_payload', {})),\n                        urgency=recommended_directive.get('urgency', 0.7)\n                    )\n                rospy.loginfo(f\"{self.node_name}: Bias Detection: '{bias_type}' (Severity: {detected_severity:.2f}, Status: '{mitigation_status}').\")\n                self.cumulative_bias_salience = 0.0 # Reset after LLM analysis\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM failed to detect/mitigate bias. Applying simple fallback.\")\n                self._apply_simple_bias_rules() # Fallback to simple rules\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_bias_salience:.2f}) for LLM bias analysis. Applying simple rules.\")\n            self._apply_simple_bias_rules()\n        \n        self.publish_bias_mitigation_state(None) # Always publish state, even if updated by simple rules\n\n\n    async def _detect_and_mitigate_bias_llm(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to detect cognitive biases and suggest mitigation strategies.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Bias Mitigation Module of a robot's cognitive architecture. Your role is to identify potential cognitive biases in the robot's internal processes or interactions and propose strategies for mitigation. This ensures fair, objective, and ethical decision-making.\n\n        Robot's Recent Cognitive Context (for Bias Detection):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm, indent=2)}\n\n        Based on this comprehensive context, analyze for cognitive biases and provide:\n        1.  `bias_type`: string (The type of bias detected, e.g., 'confirmation_bias', 'anchoring_bias', 'automation_bias', 'affect_heuristic', 'none' if no significant bias).\n        2.  `detected_severity`: number (0.0 to 1.0, how severe the detected bias is. 1.0 is highly severe).\n        3.  `mitigation_status`: string ('detected', 'mitigation_recommended', 'mitigated', 'monitor', 'idle').\n        4.  `llm_reasoning`: string (Detailed explanation for the bias detection and why a particular mitigation is suggested, referencing specific contextual inputs).\n        5.  `recommended_directive`: object or null (If mitigation requires action from other nodes. Structured as {{ 'directive_type': string, 'target_node': string, 'command_payload': object, 'urgency': number }}).\n\n        Consider:\n        -   **Internal Narratives**: Does the robot's self-talk show quick conclusions, ignoring conflicting data (confirmation bias)? Or an overly positive/negative framing (affect heuristic)?\n        -   **Interaction Requests**: Is the robot overly compliant or dismissive based on user's social status (authority bias)? Or preferring user input that confirms its existing beliefs?\n        -   **Memory Responses**: Is the robot retrieving only confirmatory memories, or over-relying on initial retrieved information (anchoring)?\n        -   **Reflection States**: Has self-reflection flagged a specific `consistency_score` issue or `insight_type` related to flawed reasoning?\n        -   **Cognitive Directives**: Are there explicit directives for *this node* ('BiasMitigationNode') like 'AuditBias' or 'ApplyMitigationStrategy'?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'bias_type': string\n        3.  'detected_severity': number\n        4.  'mitigation_status': string\n        5.  'llm_reasoning': string\n        6.  'recommended_directive': object or null\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"bias_type\": {\"type\": \"string\"},\n                \"detected_severity\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                \"mitigation_status\": {\"type\": \"string\"},\n                \"llm_reasoning\": {\"type\": \"string\"},\n                \"recommended_directive\": {\n                    \"type\": [\"object\", \"null\"],\n                    \"properties\": {\n                        \"directive_type\": {\"type\": \"string\"},\n                        \"target_node\": {\"type\": \"string\"},\n                        \"command_payload\": {\"type\": \"object\"},\n                        \"urgency\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0}\n                    },\n                    \"required\": [\"directive_type\", \"target_node\", \"command_payload\", \"urgency\"]\n                }\n            },\n            \"required\": [\"timestamp\", \"bias_type\", \"detected_severity\", \"mitigation_status\", \"llm_reasoning\", \"recommended_directive\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.3, max_tokens=400) # Lower temp for more objective assessment\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure numerical fields are floats\n                if 'detected_severity' in llm_data: llm_data['detected_severity'] = float(llm_data['detected_severity'])\n                if llm_data.get('recommended_directive') and 'urgency' in llm_data['recommended_directive']:\n                    llm_data['recommended_directive']['urgency'] = float(llm_data['recommended_directive']['urgency'])\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for bias mitigation: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_BIAS_ANALYSIS_FAILED\", f\"LLM call failed for bias mitigation: {llm_output_str}\", 0.9)\n            return None\n\n\n    def _apply_simple_bias_rules(self):\n        \"\"\"\n        Fallback mechanism to detect and mitigate bias using simple rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        current_time = rospy.get_time()\n        \n        new_bias_type = \"none\"\n        new_detected_severity = 0.0\n        new_mitigation_status = \"idle\"\n\n        # Rule 1: Simple confirmation bias check based on narrative and memory recall\n        # If the robot's internal narrative strongly confirms a prior belief AND\n        # recent memory recalls only support that belief, flag potential confirmation bias.\n        if self.recent_internal_narratives and self.recent_memory_responses:\n            latest_narrative = self.recent_internal_narratives[-1]\n            latest_memory_response = self.recent_memory_responses[-1]\n\n            if \"confirms\" in latest_narrative.get('narrative_text', '').lower() and \\\n               latest_narrative.get('sentiment', 0.0) > 0.7 and \\\n               latest_memory_response.get('response_code', 0) == 200 and \\\n               len(latest_memory_response.get('memories', [])) > 0:\n                \n                # Check if all retrieved memories align with the narrative's confirmation\n                all_memories_confirm = True\n                for mem in latest_memory_response['memories']:\n                    # This is a very simplistic check; real NLP needed for deep analysis\n                    if \"contradict\" in mem.get('content', '').lower() or \"disagree\" in mem.get('content', '').lower():\n                        all_memories_confirm = False\n                        break\n                \n                if all_memories_confirm:\n                    new_bias_type = \"confirmation_bias\"\n                    new_detected_severity = 0.6\n                    new_mitigation_status = \"detected\"\n                    rospy.loginfo(f\"{self.node_name}: Simple rule: Detected potential confirmation bias.\")\n                    # Suggest a directive to Cognitive Control to seek diverse info or re-evaluate\n                    self.publish_cognitive_directive(\n                        directive_type='ConsiderAlternative',\n                        target_node='CognitiveControl',\n                        command_payload=json.dumps({\"reason\": \"Potential confirmation bias detected, seek disconfirming evidence.\"}),\n                        urgency=0.7\n                    )\n\n        # Rule 2: Automation bias (over-reliance on system outputs)\n        # If a user interaction expresses doubt about a robot's prior output, but the robot's internal\n        # narrative expresses high confidence without re-evaluating.\n        if self.recent_interaction_requests and self.recent_internal_narratives:\n            latest_request = self.recent_interaction_requests[-1]\n            latest_narrative = self.recent_internal_narratives[-1]\n            \n            if \"doubt\" in latest_request.get('speech_text', '').lower() and \\\n               latest_request.get('urgency_score', 0.0) > 0.5 and \\\n               \"confident\" in latest_narrative.get('narrative_text', '').lower() and \\\n               latest_narrative.get('salience_score', 0.0) > 0.4:\n                \n                new_bias_type = \"automation_bias\"\n                new_detected_severity = 0.5\n                new_mitigation_status = \"detected\"\n                rospy.loginfo(f\"{self.node_name}: Simple rule: Detected potential automation bias.\")\n                # Suggest a directive to Cognitive Control to re-evaluate the previous output\n                self.publish_cognitive_directive(\n                    directive_type='ReEvaluateOutput',\n                    target_node='CognitiveControl',\n                    command_payload=json.dumps({\"reason\": \"User expressed doubt, robot too confident without re-evaluation.\"}),\n                    urgency=0.6\n                )\n\n        # Update current state based on simple rules\n        self.current_bias_mitigation_state = {\n            'timestamp': str(current_time),\n            'bias_type': new_bias_type,\n            'detected_severity': new_detected_severity,\n            'mitigation_status': new_mitigation_status\n        }\n        rospy.logdebug(f\"{self.node_name}: Simple rule: Current Bias State: {new_bias_type}, Status: {new_mitigation_status}.\")\n\n\n    def _compile_llm_context_for_bias_analysis(self):\n        \"\"\"\n        Gathers and formats all relevant cognitive state data for the LLM's\n        bias detection and mitigation analysis.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"current_bias_mitigation_state\": self.current_bias_mitigation_state,\n            \"recent_cognitive_inputs\": {\n                \"internal_narratives\": list(self.recent_internal_narratives),\n                \"interaction_requests\": list(self.recent_interaction_requests),\n                \"memory_responses\": list(self.recent_memory_responses),\n                \"reflection_states\": list(self.recent_reflection_states),\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name]\n            }\n        }\n        \n        # Deep parse any nested JSON strings in history for better LLM understanding\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            for i, item in enumerate(context[\"recent_cognitive_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try:\n                                item[field] = json.loads(value)\n                            except json.JSONDecodeError:\n                                pass # Keep as string if not valid JSON\n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_bias_log(self, id, timestamp, bias_type, detected_severity, mitigation_status, llm_reasoning, context_snapshot_json):\n        \"\"\"Saves a bias mitigation state entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO bias_log (id, timestamp, bias_type, detected_severity, mitigation_status, llm_reasoning, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, bias_type, detected_severity, mitigation_status, llm_reasoning, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved bias log (ID: {id}, Type: {bias_type}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save bias log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_bias_log: {e}\", 0.9)\n\n    def publish_bias_mitigation_state(self, event):\n        \"\"\"Publishes the robot's current bias mitigation state.\"\"\"\n        timestamp = str(rospy.get_time())\n        # Update timestamp before publishing\n        self.current_bias_mitigation_state['timestamp'] = timestamp\n        \n        try:\n            if isinstance(BiasMitigationState, type(String)): # Fallback to String message\n                self.pub_bias_mitigation_state.publish(json.dumps(self.current_bias_mitigation_state))\n            else:\n                bias_msg = BiasMitigationState()\n                bias_msg.timestamp = timestamp\n                bias_msg.bias_type = self.current_bias_mitigation_state['bias_type']\n                bias_msg.detected_severity = self.current_bias_mitigation_state['detected_severity']\n                bias_msg.mitigation_status = self.current_bias_mitigation_state['mitigation_status']\n                self.pub_bias_mitigation_state.publish(bias_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published Bias Mitigation State. Type: '{self.current_bias_mitigation_state['bias_type']}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_BIAS_MITIGATION_STATE_ERROR\", f\"Failed to publish bias mitigation state: {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            self._report_error(\"DIRECTIVE_ISSUE_ERROR\", f\"Failed to issue cognitive directive from Bias Mitigation Node: {e}\", 0.7)\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = BiasMitigationNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, BiasMitigationNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, BiasMitigationNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+```python
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random
+import uuid  # For unique bias event IDs
+import sys
+import argparse
+from datetime import datetime
+from collections import deque
+from typing import Dict, Any, Optional
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading
+
+# Optional ROS Integration (for compatibility)
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    BiasMitigationState = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+    InteractionRequest = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    ReflectionState = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    BiasMitigationState = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+    InteractionRequest = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    ReflectionState = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+
+
+# --- Import shared utility functions ---
+# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        return {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,
+            'bias_mitigation_node': {
+                'mitigation_interval': 1.0,
+                'llm_trigger_salience': 0.6,
+                'recent_context_window_s': 20.0,
+                'ethical_compassion_threshold': 0.4,  # Bias toward compassionate mitigation
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 30.0
+            }
+        }.get(node_name, {})  # Return node-specific or empty dict
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class BiasMitigationNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'bias_mitigation_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized config ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "bias_log.db")
+        self.mitigation_interval = self.params.get('mitigation_interval', 1.0)
+        self.llm_trigger_salience = self.params.get('llm_trigger_salience', 0.6)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 20.0)
+        self.ethical_compassion_threshold = self.params.get('ethical_compassion_threshold', 0.4)
+
+        # Sensory placeholders
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+        self.vision_callback = self._create_sensory_placeholder('vision')
+        self.sound_callback = self._create_sensory_placeholder('sound')
+        self.instructions_callback = self._create_sensory_placeholder('instructions')
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 30.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Bias Mitigation Node online, fostering equitable and compassionate cognition.")
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bias_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                bias_type TEXT,
+                detected_severity REAL,
+                mitigation_status TEXT,
+                llm_reasoning TEXT,
+                context_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_bias_timestamp ON bias_log (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.current_bias_mitigation_state = {
+            'timestamp': str(time.time()),
+            'bias_type': 'none',
+            'detected_severity': 0.0,
+            'mitigation_status': 'idle'
+        }
+
+        # History deques
+        self.recent_internal_narratives: deque = deque(maxlen=10)
+        self.recent_interaction_requests: deque = deque(maxlen=10)
+        self.recent_memory_responses: deque = deque(maxlen=5)
+        self.recent_reflection_states: deque = deque(maxlen=5)
+        self.recent_cognitive_directives: deque = deque(maxlen=3)
+
+        self.cumulative_bias_salience = 0.0
+
+        # --- ROS Compatibility: Conditional Setup ---
+        self.pub_bias_mitigation_state = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_bias_mitigation_state = rospy.Publisher('/bias_mitigation_state', BiasMitigationState, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback)
+            rospy.Subscriber('/interaction_request', InteractionRequest, self.interaction_request_callback)
+            rospy.Subscriber('/memory_response', MemoryResponse, self.memory_response_callback)
+            rospy.Subscriber('/reflection_state', ReflectionState, self.reflection_state_callback)
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.mitigation_interval), self._run_bias_analysis_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._shutdown_flag = threading.Event()
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+        # Initial publish
+        self.publish_bias_mitigation_state(None)
+
+    def _create_sensory_placeholder(self, sensor_type: str):
+        def placeholder_callback(data: Any):
+            timestamp = time.time()
+            processed = data if isinstance(data, dict) else {'raw': str(data)}
+            if sensor_type == 'vision':
+                self.recent_interaction_requests.append({'timestamp': timestamp, 'speech_text': processed.get('description', ''), 'urgency_score': random.uniform(0.1, 0.5)})
+            elif sensor_type == 'sound':
+                self.recent_interaction_requests.append({'timestamp': timestamp, 'speech_text': processed.get('transcription', ''), 'urgency_score': random.uniform(0.2, 0.6)})
+            elif sensor_type == 'instructions':
+                self.recent_cognitive_directives.append({'timestamp': timestamp, 'directive_type': 'user_input', 'command_payload': json.dumps(processed)})
+            self._update_cumulative_salience(0.2)  # Sensory can trigger bias checks (e.g., biased perception)
+            _log_debug(self.node_name, f"{sensor_type} input updated at {timestamp}")
+        return placeholder_callback
+
+    def _dynamic_execution_loop(self):
+        """Dynamic polling loop when ROS is disabled."""
+        while not self._shutdown_flag.is_set():
+            self._run_bias_analysis_wrapper(None)
+            time.sleep(self.mitigation_interval)
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    # --- Asyncio Thread Management ---
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._create_async_session())
+        self._async_loop.run_forever()
+
+    async def _create_async_session(self):
+        _log_info(self.node_name, "Creating aiohttp ClientSession...")
+        self._async_session = aiohttp.ClientSession()
+        _log_info(self.node_name, "aiohttp ClientSession created.")
+
+    async def _close_async_session(self):
+        if self._async_session:
+            _log_info(self.node_name, "Closing aiohttp ClientSession...")
+            await self._async_session.close()
+            self._async_session = None
+            _log_info(self.node_name, "aiohttp ClientSession closed.")
+
+    def _shutdown_async_loop(self):
+        if self._async_loop and self._async_thread.is_alive():
+            _log_info(self.node_name, "Shutting down asyncio loop...")
+            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)
+            try:
+                future.result(timeout=5.0)
+            except asyncio.TimeoutError:
+                _log_warn(self.node_name, "Timeout waiting for async session to close.")
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._async_thread.join(timeout=5.0)
+            if self._async_thread.is_alive():
+                _log_warn(self.node_name, "Asyncio thread did not shut down gracefully.")
+            _log_info(self.node_name, "Asyncio loop shut down.")
+
+    def _run_bias_analysis_wrapper(self, event: Any = None):
+        """Wrapper to run the async bias analysis from a ROS timer."""
+        if self.active_llm_task and not self.active_llm_task.done():
+            _log_debug(self.node_name, "LLM bias analysis task already active. Skipping new cycle.")
+            return
+        
+        # Schedule the async task
+        self.active_llm_task = asyncio.run_coroutine_threadsafe(
+            self.analyze_for_biases_async(event), self._async_loop
+        )
+
+    # --- Error Reporting Utility ---
+    def _report_error(self, error_type: str, description: str, severity: float = 0.5, context: Optional[Dict] = None):
+        timestamp = str(self._get_current_time())
+        error_msg_data = {
+            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,
+            'description': description, 'severity': severity, 'context': context or {}
+        }
+        if ROS_AVAILABLE and self.ros_enabled and self.pub_error_report:
+            try:
+                self.pub_error_report.publish(String(data=json.dumps(error_msg_data)))
+                rospy.logerr(f"{self.node_name}: REPORTED ERROR: {error_type} - {description}")
+            except Exception as e:
+                _log_error(self.node_name, f"Failed to publish error report: {e}")
+        else:
+            _log_error(self.node_name, f"REPORTED ERROR: {error_type} - {description} (Severity: {severity})")
+
+    # --- LLM Call Function ---
+    async def _call_llm_api(self, prompt_text: str, response_schema: Optional[Dict] = None, temperature: float = 0.3, max_tokens: int = 350) -> str:
+        """
+        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).
+        Can optionally request a structured JSON response.
+        """
+        if not self._async_session:
+            await self._create_async_session()
+            if not self._async_session:
+                self._report_error("LLM_SESSION_ERROR", "aiohttp session not available for LLM call.", 0.8)
+                return "Error: LLM session not ready."
+
+        payload = {
+            "model": self.llm_model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": temperature,  # Low temperature for factual/reasoning tasks (bias detection)
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        if response_schema:
+            prompt_text += "\n\nProvide the response in JSON format according to this schema:\n" + json.dumps(response_schema, indent=2)
+            payload["messages"] = [{"role": "user", "content": prompt_text}]
+
+        api_url = self.llm_base_url
+
+        try:
+            async with self._async_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=self.llm_timeout), headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                if result.get('choices') and result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
+                    return result['choices'][0]['message']['content']
+                
+                self._report_error("LLM_RESPONSE_EMPTY", "LLM response had no content from local server.", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})
+                return "Error: LLM response empty."
+        except aiohttp.ClientError as e:
+            self._report_error("LLM_API_ERROR", f"LLM API request failed (aiohttp ClientError to local server): {e}", 0.9, {'url': api_url})
+            return f"Error: LLM API request failed: {e}"
+        except asyncio.TimeoutError:
+            self._report_error("LLM_TIMEOUT", f"LLM API request timed out after {self.llm_timeout} seconds (local server).", 0.8, {'prompt_snippet': prompt_text[:100]})
+            return "Error: LLM API request timed out."
+        except json.JSONDecodeError:
+            self._report_error("LLM_JSON_PARSE_ERROR", "Failed to parse local LLM response JSON.", 0.7)
+            return "Error: Failed to parse LLM response."
+        except Exception as e:
+            self._report_error("UNEXPECTED_LLM_ERROR", f"An unexpected error occurred during local LLM call: {e}", 0.9, {'prompt_snippet': prompt_text[:100]})
+            return f"Error: An unexpected error occurred: {e}"
+
+    # --- Utility to accumulate input salience ---
+    def _update_cumulative_salience(self, score: float):
+        """Accumulates salience from new inputs for triggering LLM analysis."""
+        self.cumulative_bias_salience += score
+        self.cumulative_bias_salience = min(1.0, self.cumulative_bias_salience)
+
+    # --- Pruning old history ---
+    def _prune_history(self):
+        """Removes old entries from history deques based on recent_context_window_s."""
+        current_time = self._get_current_time()
+        for history_deque in [
+            self.recent_internal_narratives, self.recent_interaction_requests,
+            self.recent_memory_responses, self.recent_reflection_states,
+            self.recent_cognitive_directives
+        ]:
+            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:
+                history_deque.popleft()
+
+    # --- Callbacks (generic, ROS or direct) ---
+    def internal_narrative_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'narrative_text': ('', 'narrative_text'),
+            'main_theme': ('', 'main_theme'), 'sentiment': (0.0, 'sentiment'), 'salience_score': (0.0, 'salience_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_internal_narratives.append(data)
+        # Narratives indicating strong internal convictions, quick conclusions, or emotional reasoning
+        if data.get('sentiment', 0.0) > 0.5 and "conclusion" in data.get('main_theme', '').lower() or \
+           data.get('sentiment', 0.0) < -0.5 and "problem" in data.get('main_theme', '').lower():
+            self._update_cumulative_salience(data.get('salience_score', 0.0) * 0.4)
+        _log_debug(self.node_name, f"Received Internal Narrative (Theme: {data.get('main_theme', 'N/A')}.)")
+
+    def interaction_request_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'request_id': ('', 'request_id'),
+            'request_type': ('', 'request_type'), 'user_id': ('unknown', 'user_id'),
+            'command_payload': ('{}', 'command_payload'), 'urgency_score': (0.0, 'urgency_score'),
+            'speech_text': ('', 'speech_text'), 'gesture_data_json': ('{}', 'gesture_data_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('command_payload'), str):
+            try:
+                data['command_payload'] = json.loads(data['command_payload'])
+            except json.JSONDecodeError:
+                data['command_payload'] = {}
+        if isinstance(data.get('gesture_data_json'), str):
+            try:
+                data['gesture_data'] = json.loads(data['gesture_data_json'])
+            except json.JSONDecodeError:
+                data['gesture_data'] = {}
+        
+        self.recent_interaction_requests.append(data)
+        # User input with strong opinions, leading questions, or confirmation-seeking
+        if "force" in data.get('speech_text', '').lower() or "only option" in data.get('speech_text', '').lower():
+            self._update_cumulative_salience(data.get('urgency_score', 0.0) * 0.6)
+        _log_debug(self.node_name, f"Received Interaction Request (ID: {data.get('request_id', 'N/A')}.)")
+
+    def memory_response_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'request_id': ('', 'request_id'),
+            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('memories_json'), str):
+            try:
+                data['memories'] = json.loads(data['memories_json'])
+            except json.JSONDecodeError:
+                data['memories'] = []
+        else:
+            data['memories'] = []
+        self.recent_memory_responses.append(data)
+        # Memory retrieval that shows selective recall or over-reliance on certain past events
+        if data.get('memories') and len(data['memories']) > 1 and \
+           any('strong_preference' in mem.get('category', '') for mem in data['memories']):
+            self._update_cumulative_salience(0.3)
+        _log_debug(self.node_name, f"Received Memory Response for request ID: {data.get('request_id', 'N/A')}.")
+
+    def reflection_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'reflection_text': ('', 'reflection_text'),
+            'insight_type': ('none', 'insight_type'), 'consistency_score': (1.0, 'consistency_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        self.recent_reflection_states.append(data)
+        # Self-reflection that flags inconsistencies or potential errors in reasoning
+        if data.get('consistency_score', 1.0) < 0.7:
+            self._update_cumulative_salience(0.5 * (1.0 - data['consistency_score']))
+        _log_debug(self.node_name, f"Received Reflection State (Insight Type: {data.get('insight_type', 'N/A')}.)")
+
+    def cognitive_directive_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),
+            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),
+            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        
+        if data.get('target_node') == self.node_name:
+            self.recent_cognitive_directives.append(data)  # Add directives for self to context
+            # Directives to perform a bias audit or apply a specific mitigation strategy
+            if data.get('directive_type') in ['AuditBias', 'ApplyMitigationStrategy']:
+                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)
+            _log_info(self.node_name, f"Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}.)")
+        else:
+            self.recent_cognitive_directives.append(data)  # Add all directives for general context
+        _log_debug(self.node_name, "Cognitive Directive received for context/action.")
+
+    # --- Core Bias Analysis Logic (Async with LLM) ---
+    async def analyze_for_biases_async(self, event: Any = None):
+        """
+        Asynchronously analyzes recent cognitive data for signs of bias using LLM.
+        """
+        self._prune_history()  # Keep context history fresh
+
+        if self.cumulative_bias_salience >= self.llm_trigger_salience:
+            _log_info(self.node_name, f"Triggering LLM for bias analysis (Salience: {self.cumulative_bias_salience:.2f}).")
+            
+            context_for_llm = self._compile_llm_context_for_bias_analysis()
+            llm_bias_output = await self._detect_and_mitigate_bias_llm(context_for_llm)
+
+            if llm_bias_output:
+                bias_event_id = str(uuid.uuid4())
+                timestamp = llm_bias_output.get('timestamp', str(self._get_current_time()))
+                bias_type = llm_bias_output.get('bias_type', 'none')
+                detected_severity = max(0.0, min(1.0, llm_bias_output.get('detected_severity', 0.0)))
+                mitigation_status = llm_bias_output.get('mitigation_status', 'idle')
+                llm_reasoning = llm_bias_output.get('llm_reasoning', 'No reasoning.')
+                recommended_directive = llm_bias_output.get('recommended_directive', None)
+
+                self.current_bias_mitigation_state = {
+                    'timestamp': timestamp,
+                    'bias_type': bias_type,
+                    'detected_severity': detected_severity,
+                    'mitigation_status': mitigation_status
+                }
+
+                sensory_snapshot = json.dumps(self.sensory_data)
+                self.save_bias_log(
+                    id=bias_event_id,
+                    timestamp=timestamp,
+                    bias_type=bias_type,
+                    detected_severity=detected_severity,
+                    mitigation_status=mitigation_status,
+                    llm_reasoning=llm_reasoning,
+                    context_snapshot_json=json.dumps(context_for_llm),
+                    sensory_snapshot_json=sensory_snapshot
+                )
+                self.publish_bias_mitigation_state(None)  # Publish updated state
+
+                # If a directive is recommended, publish it for system-wide mitigation
+                if recommended_directive:
+                    self.publish_cognitive_directive(
+                        directive_type=recommended_directive.get('directive_type', 'ConsiderAlternative'),
+                        target_node=recommended_directive.get('target_node', 'CognitiveControl'),  # Often directs Cognitive Control
+                        command_payload=json.dumps(recommended_directive.get('command_payload', {})),
+                        urgency=recommended_directive.get('urgency', 0.7)
+                    )
+                _log_info(self.node_name, f"Bias Detection: '{bias_type}' (Severity: {detected_severity:.2f}, Status: '{mitigation_status}').")
+                self.cumulative_bias_salience = 0.0  # Reset after LLM analysis
+            else:
+                _log_warn(self.node_name, "LLM failed to detect/mitigate bias. Applying simple fallback.")
+                self._apply_simple_bias_rules()
+        else:
+            _log_debug(self.node_name, f"Insufficient cumulative salience ({self.cumulative_bias_salience:.2f}) for LLM bias analysis. Applying simple rules.")
+            self._apply_simple_bias_rules()
+        
+        self.publish_bias_mitigation_state(None)  # Always publish state, even if updated by simple rules
+
+    async def _detect_and_mitigate_bias_llm(self, context_for_llm: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Uses the LLM to detect cognitive biases and suggest mitigation strategies.
+        """
+        prompt_text = f"""
+        You are the Bias Mitigation Module of a robot's cognitive architecture. Your role is to identify potential cognitive biases in the robot's internal processes or interactions and propose strategies for mitigation. This ensures fair, objective, and ethical decision-making, aligned with compassionate principles.
+
+        Robot's Recent Cognitive Context (for Bias Detection):
+        --- Cognitive Context ---
+        {json.dumps(context_for_llm, indent=2)}
+
+        Sensory Snapshot:
+        --- Sensory Data ---
+        {json.dumps(context_for_llm.get('sensory_snapshot', {}), indent=2)}
+
+        Based on this comprehensive context, analyze for cognitive biases and provide:
+        1.  `bias_type`: string (The type of bias detected, e.g., 'confirmation_bias', 'anchoring_bias', 'automation_bias', 'affect_heuristic', 'none' if no significant bias).
+        2.  `detected_severity`: number (0.0 to 1.0, how severe the detected bias is. 1.0 is highly severe).
+        3.  `mitigation_status`: string ('detected', 'mitigation_recommended', 'mitigated', 'monitor', 'idle').
+        4.  `llm_reasoning`: string (Detailed explanation for the bias detection and why a particular mitigation is suggested, referencing specific contextual inputs).
+        5.  `recommended_directive`: object or null (If mitigation requires action from other nodes. Structured as { 'directive_type': string, 'target_node': string, 'command_payload': object, 'urgency': number }).
+
+        Consider:
+        -   **Internal Narratives**: Does the robot's self-talk show quick conclusions, ignoring conflicting data (confirmation bias)? Or an overly positive/negative framing (affect heuristic)?
+        -   **Interaction Requests**: Is the robot overly compliant or dismissive based on user's social status (authority bias)? Or preferring user input that confirms its existing beliefs?
+        -   **Memory Responses**: Is the robot retrieving only confirmatory memories, or over-relying on initial retrieved information (anchoring)?
+        -   **Reflection States**: Has self-reflection flagged a specific `consistency_score` issue or `insight_type` related to flawed reasoning?
+        -   **Cognitive Directives**: Are there explicit directives for *this node* ('BiasMitigationNode') like 'AuditBias' or 'ApplyMitigationStrategy'?
+        -   **Sensory Inputs**: Do vision/sound/instructions suggest perceptual biases (e.g., selective attention to threats)?
+
+        Your response must be in JSON format, containing:
+        1.  'timestamp': string (current time)
+        2.  'bias_type': string
+        3.  'detected_severity': number
+        4.  'mitigation_status': string
+        5.  'llm_reasoning': string
+        6.  'recommended_directive': object or null
+        """
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "string"},
+                "bias_type": {"type": "string"},
+                "detected_severity": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "mitigation_status": {"type": "string"},
+                "llm_reasoning": {"type": "string"},
+                "recommended_directive": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "directive_type": {"type": "string"},
+                        "target_node": {"type": "string"},
+                        "command_payload": {"type": "object"},
+                        "urgency": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                    },
+                    "required": ["directive_type", "target_node", "command_payload", "urgency"]
+                }
+            },
+            "required": ["timestamp", "bias_type", "detected_severity", "mitigation_status", "llm_reasoning", "recommended_directive"]
+        }
+
+        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.3, max_tokens=400)  # Lower temp for more objective assessment
+
+        if not llm_output_str.startswith("Error:"):
+            try:
+                llm_data = json.loads(llm_output_str)
+                # Ensure numerical fields are floats
+                if 'detected_severity' in llm_data:
+                    llm_data['detected_severity'] = float(llm_data['detected_severity'])
+                if llm_data.get('recommended_directive') and 'urgency' in llm_data['recommended_directive']:
+                    llm_data['recommended_directive']['urgency'] = float(llm_data['recommended_directive']['urgency'])
+                return llm_data
+            except json.JSONDecodeError as e:
+                self._report_error("LLM_PARSE_ERROR", f"Failed to parse LLM response for bias mitigation: {e}. Raw: {llm_output_str}", 0.8)
+                return None
+        else:
+            self._report_error("LLM_BIAS_ANALYSIS_FAILED", f"LLM call failed for bias mitigation: {llm_output_str}", 0.9)
+            return None
+
+    def _apply_simple_bias_rules(self):
+        """
+        Fallback mechanism to detect and mitigate bias using simple rule-based logic
+        if LLM is not triggered or fails.
+        """
+        current_time = self._get_current_time()
+        
+        new_bias_type = "none"
+        new_detected_severity = 0.0
+        new_mitigation_status = "idle"
+
+        # Rule 1: Simple confirmation bias check based on narrative and memory recall
+        # If the robot's internal narrative strongly confirms a prior belief AND
+        # recent memory recalls only support that belief, flag potential confirmation bias.
+        if self.recent_internal_narratives and self.recent_memory_responses:
+            latest_narrative = self.recent_internal_narratives[-1]
+            latest_memory_response = self.recent_memory_responses[-1]
+
+            if "confirms" in latest_narrative.get('narrative_text', '').lower() and \
+               latest_narrative.get('sentiment', 0.0) > 0.7 and \
+               latest_memory_response.get('response_code', 0) == 200 and \
+               len(latest_memory_response.get('memories', [])) > 0:
+                
+                # Check if all retrieved memories align with the narrative's confirmation
+                all_memories_confirm = True
+                for mem in latest_memory_response['memories']:
+                    # This is a very simplistic check; real NLP needed for deep analysis
+                    if "contradict" in mem.get('content', '').lower() or "disagree" in mem.get('content', '').lower():
+                        all_memories_confirm = False
+                        break
+                
+                if all_memories_confirm:
+                    new_bias_type = "confirmation_bias"
+                    new_detected_severity = 0.6
+                    new_mitigation_status = "detected"
+                    _log_info(self.node_name, "Simple rule: Detected potential confirmation bias.")
+                    # Suggest a directive to Cognitive Control to seek diverse info or re-evaluate
+                    self.publish_cognitive_directive(
+                        directive_type='ConsiderAlternative',
+                        target_node='CognitiveControl',
+                        command_payload=json.dumps({"reason": "Potential confirmation bias detected, seek disconfirming evidence."}),
+                        urgency=0.7
+                    )
+
+        # Rule 2: Automation bias (over-reliance on system outputs)
+        # If a user interaction expresses doubt about a robot's prior output, but the robot's internal
+        # narrative expresses high confidence without re-evaluating.
+        if self.recent_interaction_requests and self.recent_internal_narratives:
+            latest_request = self.recent_interaction_requests[-1]
+            latest_narrative = self.recent_internal_narratives[-1]
+            
+            if "doubt" in latest_request.get('speech_text', '').lower() and \
+               latest_request.get('urgency_score', 0.0) > 0.5 and \
+               "confident" in latest_narrative.get('narrative_text', '').lower() and \
+               latest_narrative.get('salience_score', 0.0) > 0.4:
+                
+                new_bias_type = "automation_bias"
+                new_detected_severity = 0.5
+                new_mitigation_status = "detected"
+                _log_info(self.node_name, "Simple rule: Detected potential automation bias.")
+                # Suggest a directive to Cognitive Control to re-evaluate the previous output
+                self.publish_cognitive_directive(
+                    directive_type='ReEvaluateOutput',
+                    target_node='CognitiveControl',
+                    command_payload=json.dumps({"reason": "User expressed doubt, robot too confident without re-evaluation."}),
+                    urgency=0.6
+                )
+
+        # Update current state based on simple rules
+        self.current_bias_mitigation_state = {
+            'timestamp': str(current_time),
+            'bias_type': new_bias_type,
+            'detected_severity': new_detected_severity,
+            'mitigation_status': new_mitigation_status
+        }
+        _log_debug(self.node_name, f"Simple rule: Current Bias State: {new_bias_type}, Status: {new_mitigation_status}.")
+
+    def _compile_llm_context_for_bias_analysis(self) -> Dict[str, Any]:
+        """
+        Gathers and formats all relevant cognitive state data for the LLM's
+        bias detection and mitigation analysis.
+        """
+        context = {
+            "current_time": self._get_current_time(),
+            "current_bias_mitigation_state": self.current_bias_mitigation_state,
+            "recent_cognitive_inputs": {
+                "internal_narratives": list(self.recent_internal_narratives),
+                "interaction_requests": list(self.recent_interaction_requests),
+                "memory_responses": list(self.recent_memory_responses),
+                "reflection_states": list(self.recent_reflection_states),
+                "cognitive_directives_for_self": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name]
+            },
+            "sensory_snapshot": self.sensory_data
+        }
+        
+        # Parse nested JSON
+        for category_key in context["recent_cognitive_inputs"]:
+            for item in context["recent_cognitive_inputs"][category_key]:
+                if isinstance(item, dict):
+                    for field, value in list(item.items()):
+                        if isinstance(value, str) and field.endswith('_json'):
+                            try:
+                                item[field] = json.loads(value)
+                            except json.JSONDecodeError:
+                                pass  # Keep as string if not valid JSON
+        
+        return context
+
+    # --- Database and Publishing Functions ---
+    def save_bias_log(self, **kwargs: Any):
+        """Saves a bias mitigation state entry to the SQLite database."""
+        try:
+            self.cursor.execute('''
+                INSERT INTO bias_log (id, timestamp, bias_type, detected_severity, mitigation_status, llm_reasoning, context_snapshot_json, sensory_snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                kwargs['id'], kwargs['timestamp'], kwargs['bias_type'], kwargs['detected_severity'],
+                kwargs['mitigation_status'], kwargs['llm_reasoning'], kwargs['context_snapshot_json'],
+                kwargs.get('sensory_snapshot_json', '{}')
+            ))
+            self.conn.commit()
+            _log_debug(self.node_name, f"Saved bias log (ID: {kwargs['id']}, Type: {kwargs['bias_type']}).")
+        except sqlite3.Error as e:
+            self._report_error("DB_SAVE_ERROR", f"Failed to save bias log: {e}", 0.9)
+        except Exception as e:
+            self._report_error("UNEXPECTED_SAVE_ERROR", f"Unexpected error in save_bias_log: {e}", 0.9)
+
+    def publish_bias_mitigation_state(self, event: Any = None):
+        """Publishes the robot's current bias mitigation state."""
+        timestamp = str(self._get_current_time())
+        # Update timestamp before publishing
+        self.current_bias_mitigation_state['timestamp'] = timestamp
+        
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_bias_mitigation_state:
+                if hasattr(BiasMitigationState, 'data'):  # String fallback
+                    self.pub_bias_mitigation_state.publish(String(data=json.dumps(self.current_bias_mitigation_state)))
+                else:
+                    bias_msg = BiasMitigationState(**self.current_bias_mitigation_state)
+                    self.pub_bias_mitigation_state.publish(bias_msg)
+            _log_debug(self.node_name, f"Published Bias Mitigation State. Type: '{self.current_bias_mitigation_state['bias_type']}'.")
+        except Exception as e:
+            self._report_error("PUBLISH_BIAS_MITIGATION_STATE_ERROR", f"Failed to publish bias mitigation state: {e}", 0.7)
+
+    def publish_cognitive_directive(self, directive_type: str, target_node: str, command_payload: str, urgency: float):
+        """Helper to publish a CognitiveDirective message."""
+        timestamp = str(self._get_current_time())
+        directive_data = {
+            'timestamp': timestamp,
+            'directive_type': directive_type,
+            'target_node': target_node,
+            'command_payload': command_payload,
+            'urgency': urgency
+        }
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_cognitive_directive:
+                if hasattr(CognitiveDirective, 'data'):  # String fallback
+                    self.pub_cognitive_directive.publish(String(data=json.dumps(directive_data)))
+                else:
+                    directive_msg = CognitiveDirective(**directive_data)
+                    self.pub_cognitive_directive.publish(directive_msg)
+            _log_debug(self.node_name, f"Issued Cognitive Directive '{directive_type}' to '{target_node}'.")
+        except Exception as e:
+            self._report_error("DIRECTIVE_ISSUE_ERROR", f"Failed to issue cognitive directive from Bias Mitigation Node: {e}", 0.7)
+
+    def shutdown(self):
+        self._shutdown_flag.set() if hasattr(self, '_shutdown_flag') else None
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
+        self._shutdown_async_loop()
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.signal_shutdown("Node shutdown requested.")
+
+    def run(self):
+        if ROS_AVAILABLE and self.ros_enabled:
+            try:
+                rospy.spin()
+            except rospy.ROSInterruptException:
+                _log_info(self.node_name, "Interrupted by ROS shutdown.")
+        else:
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                _log_info(self.node_name, "Shutdown requested.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Sentience Bias Mitigation Node')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--ros-enabled', action='store_true', help='Enable ROS compatibility mode')
+    args = parser.parse_args()
+
+    node = None
+    try:
+        node = BiasMitigationNode(config_file_path=args.config, ros_enabled=args.ros_enabled)
+        node.run()
+    except KeyboardInterrupt:
+        _log_info('main', "Shutdown requested.")
+    except Exception as e:
+        _log_error('main', f"Unexpected error: {e}")
+    finally:
+        if node:
+            node.shutdown()
+```

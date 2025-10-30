@@ -1,1 +1,553 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random # Used sparingly for unique IDs or minor variations\nimport uuid # For generating unique body awareness event IDs\n\n# --- NEW: Importing the necessary libraries for Async LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading # To run asyncio loop in a separate thread\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        BodyAwarenessState,     # Output: Robot's inferred body state (e.g., posture, anomalies)\n        JointState,             # Input: Standard ROS JointState message (or similar for joint positions/velocities/efforts)\n        ForceTorque,            # Input: Force/torque sensor data (e.g., from grippers, feet)\n        TactileSensor,          # Input: Tactile sensor data (e.g., contact, pressure)\n        RobotHealth,            # Input: Robot's overall health/system status (e.g., battery, motor temp)\n        CognitiveDirective,     # Input: Directives for body awareness (e.g., \"check arm integrity\")\n        MemoryResponse,         # Input: Retrieved memories (e.g., past successful movements, calibrated values)\n        InternalNarrative       # Input: Robot's internal thoughts (can reflect on body state)\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Body Awareness Node.\")\n    BodyAwarenessState = String\n    JointState = String # Using String as fallback for JointState as well\n    ForceTorque = String\n    TactileSensor = String\n    RobotHealth = String\n    CognitiveDirective = String\n    MemoryResponse = String\n    InternalNarrative = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- NEW: Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'body_awareness_node': {\n                'body_awareness_analysis_interval': 0.2,\n                'llm_analysis_threshold_salience': 0.5,\n                'recent_context_window_s': 5.0\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 20.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass BodyAwarenessNode:\n    def __init__(self):\n        # Initialize the ROS node with a unique name.\n        rospy.init_node('body_awareness_node', anonymous=False)\n        self.node_name = rospy.get_name() # Store node name for logging in utilities\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"body_awareness_log.db\")\n        self.analysis_interval = self.params.get('body_awareness_analysis_interval', 0.2) # How often to analyze body state\n        self.llm_analysis_threshold_salience = self.params.get('llm_analysis_threshold_salience', 0.5) # Cumulative salience to trigger LLM analysis\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0) # Window for deques for LLM context\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 20.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'body_awareness_log' table if it doesn't exist.\n        # NEW: Added 'llm_reasoning', 'context_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS body_awareness_log (\n                id TEXT PRIMARY KEY,            -- Unique awareness event ID (UUID)\n                timestamp TEXT,\n                body_state TEXT,                -- e.g., 'normal', 'unbalanced', 'collision_detected'\n                posture_description TEXT,       -- Descriptive text about posture\n                anomaly_detected BOOLEAN,       -- True if an anomaly is present\n                anomaly_severity REAL,          -- Severity of anomaly (0.0 to 1.0)\n                llm_reasoning TEXT,             -- NEW: LLM's detailed reasoning for state/anomaly inference\n                context_snapshot_json TEXT      -- NEW: JSON of relevant cognitive context at time of inference\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_awareness_timestamp ON body_awareness_log (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.current_body_awareness_state = {\n            'timestamp': str(rospy.get_time()),\n            'body_state': 'normal',\n            'posture_description': 'stable',\n            'anomaly_detected': False,\n            'anomaly_severity': 0.0\n        }\n\n        # Deques to maintain a short history of inputs relevant to body awareness\n        self.recent_joint_states = deque(maxlen=10)\n        self.recent_force_torques = deque(maxlen=10)\n        self.recent_tactile_sensor_data = deque(maxlen=10)\n        self.recent_robot_health_states = deque(maxlen=5)\n        self.recent_cognitive_directives = deque(maxlen=3) # Directives *for* this node\n        self.recent_memory_responses = deque(maxlen=3) # For calibration data, movement norms\n        self.recent_internal_narratives = deque(maxlen=5) # For robot's self-reflection on body\n\n        self.cumulative_body_salience = 0.0 # Aggregated salience to trigger LLM analysis\n\n        # --- Publishers ---\n        self.pub_body_awareness_state = rospy.Publisher('/body_awareness_state', BodyAwarenessState, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # For requesting attention or memory\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/joint_states', JointState, self.joint_state_callback)\n        rospy.Subscriber('/force_torque_sensors', ForceTorque, self.force_torque_callback)\n        rospy.Subscriber('/tactile_sensors', TactileSensor, self.tactile_sensor_callback)\n        rospy.Subscriber('/robot_health', RobotHealth, self.robot_health_callback)\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n        rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback)\n\n\n        # --- Timer for periodic body awareness analysis ---\n        rospy.Timer(rospy.Duration(self.analysis_interval), self._run_body_analysis_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's body awareness system online.\")\n        # Publish initial state\n        self.publish_body_awareness_state(None)\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_body_analysis_wrapper(self, event):\n        \"\"\"Wrapper to run the async body awareness analysis from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM body analysis task already active. Skipping new cycle.\")\n            return\n        \n        # Schedule the async task\n        self.active_llm_task = asyncio.run_coroutine_threadsafe(\n            self.analyze_body_state_async(event), self._async_loop\n        )\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.3, max_tokens=300):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Low temperature for factual/reasoning tasks\n            \"max_tokens\": max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0]['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM analysis.\"\"\"\n        self.cumulative_body_salience += score\n        self.cumulative_body_salience = min(1.0, self.cumulative_body_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_joint_states, self.recent_force_torques, self.recent_tactile_sensor_data,\n            self.recent_robot_health_states, self.recent_cognitive_directives,\n            self.recent_memory_responses, self.recent_internal_narratives\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def joint_state_callback(self, msg):\n        # NOTE: Standard sensor_msgs/JointState doesn't have a 'timestamp' attribute directly on the message,\n        # but in ROS it has a header with stamp. Assuming message converted to dictionary or has direct attributes.\n        # If using actual sensor_msgs.msg.JointState, adjust 'timestamp' access (e.g., msg.header.stamp.to_sec())\n        fields_map = {\n            'header.stamp': (str(rospy.get_time()), 'timestamp'), # Accessing header.stamp, assuming parsed\n            'name': ([], 'joint_names'), # List of joint names\n            'position': ([], 'positions'), # List of joint positions\n            'velocity': ([], 'velocities'), # List of joint velocities\n            'effort': ([], 'efforts') # List of joint efforts\n        }\n        # Special handling for JointState if it's not a String message.\n        # If it's a real JointState message, its structure needs direct attribute access.\n        # For simplicity, if it's String fallback, it's JSON.\n        if isinstance(msg, String):\n            data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        else: # Assume actual JointState message type\n            # Directly access attributes of JointState message\n            data = {\n                'timestamp': str(msg.header.stamp.to_sec()),\n                'joint_names': msg.name,\n                'positions': msg.position,\n                'velocities': msg.velocity,\n                'efforts': msg.effort\n            }\n        \n        # Calculate a simple 'salience' for joint state changes (e.g., high velocity/effort indicates activity)\n        # This is a heuristic; real salience might need more sophisticated models.\n        salience = 0.0\n        if data.get('velocities'):\n            salience += sum([abs(v) for v in data['velocities']]) * 0.05\n        if data.get('efforts'):\n            salience += sum([abs(e) for e in data['efforts']]) * 0.02\n        data['salience_score'] = min(1.0, salience) # Clamp salience\n\n        self.recent_joint_states.append(data)\n        self._update_cumulative_salience(data['salience_score'] * 0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Joint State (Activity Salience: {data['salience_score']:.2f}).\")\n\n    def force_torque_callback(self, msg):\n        # Assuming ForceTorque message has 'header.stamp', 'wrench.force.x', 'wrench.torque.x' etc.\n        fields_map = {\n            'header.stamp': (str(rospy.get_time()), 'timestamp'),\n            'wrench.force.x': (0.0, 'force_x'), 'wrench.force.y': (0.0, 'force_y'), 'wrench.force.z': (0.0, 'force_z'),\n            'wrench.torque.x': (0.0, 'torque_x'), 'wrench.torque.y': (0.0, 'torque_y'), 'wrench.torque.z': (0.0, 'torque_z')\n        }\n        if isinstance(msg, String):\n            data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        else: # Assume actual ForceTorque message type (e.g., geometry_msgs/WrenchStamped)\n            data = {\n                'timestamp': str(msg.header.stamp.to_sec()),\n                'force_x': msg.wrench.force.x, 'force_y': msg.wrench.force.y, 'force_z': msg.wrench.force.z,\n                'torque_x': msg.wrench.torque.x, 'torque_y': msg.wrench.torque.y, 'torque_z': msg.wrench.torque.z\n            }\n\n        salience = 0.0\n        # High force/torque indicates interaction or impact\n        if data.get('force_x') is not None: salience += abs(data['force_x']) * 0.1\n        if data.get('force_y') is not None: salience += abs(data['force_y']) * 0.1\n        if data.get('force_z') is not None: salience += abs(data['force_z']) * 0.1\n        data['salience_score'] = min(1.0, salience * 0.5) # Clamp and scale\n\n        self.recent_force_torques.append(data)\n        self._update_cumulative_salience(data['salience_score'] * 0.5) # Force/torque implies significant interaction\n        rospy.logdebug(f\"{self.node_name}: Received Force/Torque data (Salience: {data['salience_score']:.2f}).\")\n\n    def tactile_sensor_callback(self, msg):\n        # Assuming TactileSensor message has 'timestamp', 'contact_points_json', 'pressure_sum', 'num_contacts'\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'),\n            'contact_points_json': ('[]', 'contact_points_json'),\n            'pressure_sum': (0.0, 'pressure_sum'),\n            'num_contacts': (0, 'num_contacts')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('contact_points_json'), str):\n            try: data['contact_points'] = json.loads(data['contact_points_json'])\n            except json.JSONDecodeError: data['contact_points'] = []\n\n        salience = data.get('pressure_sum', 0.0) * 0.3 + data.get('num_contacts', 0) * 0.1\n        data['salience_score'] = min(1.0, salience) # Clamp salience\n\n        self.recent_tactile_sensor_data.append(data)\n        self._update_cumulative_salience(data['salience_score'] * 0.4) # Tactile input implies physical interaction\n        rospy.logdebug(f\"{self.node_name}: Received Tactile Sensor data (Contacts: {data['num_contacts']}, Pressure: {data['pressure_sum']:.2f}).\")\n\n    def robot_health_callback(self, msg):\n        # Assuming RobotHealth message has 'timestamp', 'overall_status', 'battery_level', 'motor_temps_json', 'error_flags_json'\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'),\n            'overall_status': ('normal', 'overall_status'),\n            'battery_level': (100.0, 'battery_level'),\n            'motor_temps_json': ('{}', 'motor_temps_json'),\n            'error_flags_json': ('{}', 'error_flags_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('motor_temps_json'), str):\n            try: data['motor_temps'] = json.loads(data['motor_temps_json'])\n            except json.JSONDecodeError: data['motor_temps'] = {}\n        if isinstance(data.get('error_flags_json'), str):\n            try: data['error_flags'] = json.loads(data['error_flags_json'])\n            except json.JSONDecodeError: data['error_flags'] = {}\n\n        salience = 0.0\n        if data.get('overall_status') == 'critical': salience = 1.0\n        elif data.get('overall_status') == 'warning': salience = 0.7\n        if data.get('battery_level', 100.0) < 20.0: salience = max(salience, 0.6)\n        if data.get('error_flags'): # If any error flags are true\n            if any(data['error_flags'].values()): salience = max(salience, 0.8)\n        data['salience_score'] = min(1.0, salience)\n\n        self.recent_robot_health_states.append(data)\n        self._update_cumulative_salience(data['salience_score'] * 0.9) # Health issues are high priority\n        rospy.logdebug(f\"{self.node_name}: Received Robot Health State (Status: {data['overall_status']}, Salience: {data['salience_score']:.2f}).\")\n\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name:\n            self.recent_cognitive_directives.append(data) # Add directives for self to context\n            # Directives for body integrity checks or specific posture adjustments are highly salient\n            if data.get('directive_type') in ['CheckBodyIntegrity', 'AdjustPosture']:\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)\n            rospy.loginfo(f\"{self.node_name}: Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}).\")\n        else:\n            self.recent_cognitive_directives.append(data) # Add all directives for general context\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Memory responses containing calibration data, movement norms, or past anomaly records\n        if data.get('response_code', 0) == 200 and \\\n           any('calibration' in mem.get('category', '') or 'anomaly' in mem.get('category', '') for mem in data['memories']):\n            self._update_cumulative_salience(0.3)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def internal_narrative_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'narrative_text': ('', 'narrative_text'),\n            'main_theme': ('', 'main_theme'), 'sentiment': (0.0, 'sentiment'), 'salience_score': (0.0, 'salience_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_internal_narratives.append(data)\n        # Narratives expressing discomfort, pain, or self-doubt about movement\n        if \"pain\" in data.get('narrative_text', '').lower() or \\\n           \"unstable\" in data.get('narrative_text', '').lower() or \\\n           data.get('sentiment', 0.0) < -0.5:\n            self._update_cumulative_salience(data.get('salience_score', 0.0) * 0.7)\n        rospy.logdebug(f\"{self.node_name}: Received Internal Narrative (Theme: {data.get('main_theme', 'N/A')}).\")\n\n    # --- Core Body Awareness Analysis Logic (Async with LLM) ---\n    async def analyze_body_state_async(self, event):\n        \"\"\"\n        Asynchronously analyzes recent physical sensor data and internal states\n        to infer the robot's current body state and detect anomalies.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        if self.cumulative_body_salience >= self.llm_analysis_threshold_salience:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for body awareness analysis (Salience: {self.cumulative_body_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_body_awareness()\n            llm_body_output = await self._infer_body_state_llm(context_for_llm)\n\n            if llm_body_output:\n                awareness_event_id = str(uuid.uuid4())\n                timestamp = llm_body_output.get('timestamp', str(rospy.get_time()))\n                body_state = llm_body_output.get('body_state', 'normal')\n                posture_description = llm_body_output.get('posture_description', 'stable')\n                anomaly_detected = llm_body_output.get('anomaly_detected', False)\n                anomaly_severity = max(0.0, min(1.0, llm_body_output.get('anomaly_severity', 0.0)))\n                llm_reasoning = llm_body_output.get('llm_reasoning', 'No reasoning.')\n\n                self.current_body_awareness_state = {\n                    'timestamp': timestamp,\n                    'body_state': body_state,\n                    'posture_description': posture_description,\n                    'anomaly_detected': anomaly_detected,\n                    'anomaly_severity': anomaly_severity\n                }\n\n                self.save_body_awareness_log(\n                    id=awareness_event_id,\n                    timestamp=timestamp,\n                    body_state=body_state,\n                    posture_description=posture_description,\n                    anomaly_detected=anomaly_detected,\n                    anomaly_severity=anomaly_severity,\n                    llm_reasoning=llm_reasoning,\n                    context_snapshot_json=json.dumps(context_for_llm)\n                )\n                self.publish_body_awareness_state(None) # Publish updated state\n\n                if anomaly_detected and anomaly_severity > 0.5:\n                    self.publish_cognitive_directive(\n                        directive_type='AddressBodyAnomaly',\n                        target_node='CognitiveControl', # Direct CognitiveControl to handle body anomalies\n                        command_payload=json.dumps({\"anomaly_type\": body_state, \"severity\": anomaly_severity, \"description\": posture_description}),\n                        urgency=anomaly_severity # Urgency scales with severity\n                    )\n                rospy.loginfo(f\"{self.node_name}: Inferred Body State: '{body_state}' (Posture: '{posture_description}', Anomaly: {anomaly_detected}, Severity: {anomaly_severity:.2f}).\")\n                self.cumulative_body_salience = 0.0 # Reset after LLM analysis\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM failed to infer body state. Applying simple fallback.\")\n                self._apply_simple_body_rules() # Fallback to simple rules\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_body_salience:.2f}) for LLM body awareness analysis. Applying simple rules.\")\n            self._apply_simple_body_rules()\n        \n        self.publish_body_awareness_state(None) # Always publish state, even if updated by simple rules\n\n\n    async def _infer_body_state_llm(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to infer the robot's current body state, posture, and detect anomalies.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Body Awareness Module of a robot's cognitive architecture. Your task is to analyze the robot's physical sensor data and internal reflections to infer its current body state, posture, and detect any physical anomalies or issues.\n\n        Robot's Recent Physical and Internal Context (for Body Awareness Inference):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm, indent=2)}\n\n        Based on this context, provide:\n        1.  `body_state`: string (Overall physical state, e.g., 'normal', 'unbalanced', 'collision_detected', 'motor_overheating', 'low_battery', 'damaged').\n        2.  `posture_description`: string (A concise description of the robot's inferred posture or movement state, e.g., 'standing_stable', 'leaning_left', 'moving_slowly', 'immobilized').\n        3.  `anomaly_detected`: boolean (True if a physical anomaly or significant issue is detected).\n        4.  `anomaly_severity`: number (0.0 to 1.0, indicating the severity of any detected anomaly. 1.0 is highest severity).\n        5.  `llm_reasoning`: string (Detailed explanation for your inference, referencing specific contextual inputs).\n\n        Consider:\n        -   **Joint States**: Are joint `positions`, `velocities`, or `efforts` abnormal or indicative of a specific posture/movement?\n        -   **Force/Torque**: Is there unexpected `force` or `torque` indicating collision or strain?\n        -   **Tactile Sensor**: Is `pressure_sum` or `num_contacts` indicating unexpected contact?\n        -   **Robot Health**: Is `overall_status`, `battery_level`, or `motor_temps` signaling issues?\n        -   **Cognitive Directives**: Are there specific directives for *this node* ('BodyAwarenessNode') like 'CheckBodyIntegrity'?\n        -   **Memory Responses**: Are there relevant calibration data or past anomaly records from memory?\n        -   **Internal Narratives**: Is the robot expressing sensations of discomfort, pain, or instability in its self-talk?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'body_state': string\n        3.  'posture_description': string\n        4.  'anomaly_detected': boolean\n        5.  'anomaly_severity': number\n        6.  'llm_reasoning': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"body_state\": {\"type\": \"string\"},\n                \"posture_description\": {\"type\": \"string\"},\n                \"anomaly_detected\": {\"type\": \"boolean\"},\n                \"anomaly_severity\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                \"llm_reasoning\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"body_state\", \"posture_description\", \"anomaly_detected\", \"anomaly_severity\", \"llm_reasoning\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.3, max_tokens=350)\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure numerical fields are floats/booleans\n                if 'anomaly_detected' in llm_data: llm_data['anomaly_detected'] = bool(llm_data['anomaly_detected'])\n                if 'anomaly_severity' in llm_data: llm_data['anomaly_severity'] = float(llm_data['anomaly_severity'])\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for body awareness: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_BODY_ANALYSIS_FAILED\", f\"LLM call failed for body awareness: {llm_output_str}\", 0.9)\n            return None\n\n    def _apply_simple_body_rules(self):\n        \"\"\"\n        Fallback mechanism to infer body awareness state using simple rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        current_time = rospy.get_time()\n        \n        new_body_state = \"normal\"\n        new_posture_description = \"stable\"\n        new_anomaly_detected = False\n        new_anomaly_severity = 0.0\n\n        # Rule 1: Detect low battery\n        if self.recent_robot_health_states:\n            latest_health = self.recent_robot_health_states[-1]\n            if latest_health.get('battery_level', 100.0) < 15.0:\n                new_body_state = \"low_battery\"\n                new_posture_description = \"seeking_charger\"\n                new_anomaly_detected = True\n                new_anomaly_severity = max(new_anomaly_severity, 0.7)\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Detected low battery.\")\n\n        # Rule 2: Detect significant force/torque (potential collision or heavy load)\n        if self.recent_force_torques:\n            latest_ft = self.recent_force_torques[-1]\n            force_magnitude = (latest_ft.get('force_x', 0)**2 + latest_ft.get('force_y', 0)**2 + latest_ft.get('force_z', 0)**2)**0.5\n            if force_magnitude > 50.0: # Threshold for significant force (adjust as needed)\n                new_body_state = \"collision_detected\" if force_magnitude > 100.0 else \"under_load\"\n                new_posture_description = \"bracing_for_impact\" if force_magnitude > 100.0 else \"carrying_object\"\n                new_anomaly_detected = True\n                new_anomaly_severity = max(new_anomaly_severity, min(1.0, force_magnitude / 150.0))\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Detected significant force/torque.\")\n\n        # Rule 3: Detect extreme joint positions (potential constraint violation or unusual posture)\n        if self.recent_joint_states:\n            latest_js = self.recent_joint_states[-1]\n            # This is a very simplified check; real joint limits would be defined per joint.\n            # Assuming any position outside a -PI to PI range is \"extreme\" for this simple rule.\n            if any(abs(pos) > 3.14 for pos in latest_js.get('positions', [])):\n                new_body_state = \"unusual_posture\"\n                new_posture_description = \"awkward_position\"\n                new_anomaly_detected = True\n                new_anomaly_severity = max(new_anomaly_severity, 0.4)\n                rospy.logdebug(f\"{self.node_name}: Simple rule: Detected unusual joint posture.\")\n\n        # Update current state based on simple rules\n        self.current_body_awareness_state = {\n            'timestamp': str(current_time),\n            'body_state': new_body_state,\n            'posture_description': new_posture_description,\n            'anomaly_detected': new_anomaly_detected,\n            'anomaly_severity': new_anomaly_severity\n        }\n        rospy.logdebug(f\"{self.node_name}: Simple rule: Current Body State: {new_body_state}, Anomaly: {new_anomaly_detected}.\")\n\n\n    def _compile_llm_context_for_body_awareness(self):\n        \"\"\"\n        Gathers and formats all relevant physical sensor data and internal states\n        for the LLM's body awareness analysis.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"current_body_awareness_state\": self.current_body_awareness_state,\n            \"recent_physical_inputs\": {\n                \"joint_states\": list(self.recent_joint_states),\n                \"force_torques\": list(self.recent_force_torques),\n                \"tactile_sensor_data\": list(self.recent_tactile_sensor_data),\n                \"robot_health_states\": list(self.recent_robot_health_states)\n            },\n            \"recent_cognitive_inputs\": {\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name],\n                \"memory_responses\": list(self.recent_memory_responses),\n                \"internal_narratives\": list(self.recent_internal_narratives)\n            }\n        }\n        \n        # Deep parse any nested JSON strings in context for better LLM understanding\n        for category_key in context[\"recent_physical_inputs\"]:\n            for i, item in enumerate(context[\"recent_physical_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try: item[field] = json.loads(value)\n                            except json.JSONDecodeError: pass\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            for i, item in enumerate(context[\"recent_cognitive_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try: item[field] = json.loads(value)\n                            except json.JSONDecodeError: pass\n        \n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_body_awareness_log(self, id, timestamp, body_state, posture_description, anomaly_detected, anomaly_severity, llm_reasoning, context_snapshot_json):\n        \"\"\"Saves a body awareness state entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO body_awareness_log (id, timestamp, body_state, posture_description, anomaly_detected, anomaly_severity, llm_reasoning, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, body_state, posture_description, anomaly_detected, anomaly_severity, llm_reasoning, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved body awareness log (ID: {id}, State: {body_state}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save body awareness log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_body_awareness_log: {e}\", 0.9)\n\n\n    def publish_body_awareness_state(self, event):\n        \"\"\"Publishes the robot's current body awareness state.\"\"\"\n        timestamp = str(rospy.get_time())\n        # Update timestamp before publishing\n        self.current_body_awareness_state['timestamp'] = timestamp\n        \n        try:\n            if isinstance(BodyAwarenessState, type(String)): # Fallback to String message\n                self.pub_body_awareness_state.publish(json.dumps(self.current_body_awareness_state))\n            else:\n                awareness_msg = BodyAwarenessState()\n                awareness_msg.timestamp = timestamp\n                awareness_msg.body_state = self.current_body_awareness_state['body_state']\n                awareness_msg.posture_description = self.current_body_awareness_state['posture_description']\n                awareness_msg.anomaly_detected = self.current_body_awareness_state['anomaly_detected']\n                awareness_msg.anomaly_severity = self.current_body_awareness_state['anomaly_severity']\n                self.pub_body_awareness_state.publish(awareness_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published Body Awareness State. State: '{self.current_body_awareness_state['body_state']}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_BODY_AWARENESS_STATE_ERROR\", f\"Failed to publish body awareness state: {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to issue cognitive directive from Body Awareness Node: {e}\")\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = BodyAwarenessNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, BodyAwarenessNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, BodyAwarenessNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+```python:disable-run
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random  # Used sparingly for unique IDs or minor variations
+import uuid  # For generating unique body awareness event IDs
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Optional, Deque
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading  # To run asyncio loop in a separate thread
+from collections import deque
+
+# Optional ROS Integration (for compatibility)
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    BodyAwarenessState = ROSMsgFallback
+    JointState = ROSMsgFallback
+    ForceTorque = ROSMsgFallback
+    TactileSensor = ROSMsgFallback
+    RobotHealth = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    BodyAwarenessState = ROSMsgFallback
+    JointState = ROSMsgFallback
+    ForceTorque = ROSMsgFallback
+    TactileSensor = ROSMsgFallback
+    RobotHealth = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    InternalNarrative = ROSMsgFallback
+
+
+# --- Import shared utility functions ---
+# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        return {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,
+            'body_awareness_node': {
+                'body_awareness_analysis_interval': 0.2,
+                'llm_analysis_threshold_salience': 0.5,
+                'recent_context_window_s': 5.0,
+                'ethical_compassion_threshold': 0.3,  # Bias toward self-care and mindful movement
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 20.0
+            }
+        }.get(node_name, {})  # Return node-specific or empty dict
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class BodyAwarenessNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'body_awareness_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized config ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "body_awareness_log.db")
+        self.analysis_interval = self.params.get('body_awareness_analysis_interval', 0.2)
+        self.llm_analysis_threshold_salience = self.params.get('llm_analysis_threshold_salience', 0.5)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0)
+        self.ethical_compassion_threshold = self.params.get('ethical_compassion_threshold', 0.3)
+
+        # Sensory placeholders
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+        self.vision_callback = self._create_sensory_placeholder('vision')
+        self.sound_callback = self._create_sensory_placeholder('sound')
+        self.instructions_callback = self._create_sensory_placeholder('instructions')
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 20.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Robot's body awareness system online, nurturing mindful embodiment.")
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS body_awareness_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                body_state TEXT,
+                posture_description TEXT,
+                anomaly_detected BOOLEAN,
+                anomaly_severity REAL,
+                llm_reasoning TEXT,
+                context_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_awareness_timestamp ON body_awareness_log (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.current_body_awareness_state = {
+            'timestamp': str(time.time()),
+            'body_state': 'normal',
+            'posture_description': 'stable',
+            'anomaly_detected': False,
+            'anomaly_severity': 0.0
+        }
+
+        # History deques
+        self.recent_joint_states: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self.recent_force_torques: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self.recent_tactile_sensor_data: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self.recent_robot_health_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_cognitive_directives: Deque[Dict[str, Any]] = deque(maxlen=3)
+        self.recent_memory_responses: Deque[Dict[str, Any]] = deque(maxlen=3)
+        self.recent_internal_narratives: Deque[Dict[str, Any]] = deque(maxlen=5)
+
+        self.cumulative_body_salience = 0.0
+
+        # --- ROS Compatibility: Conditional Setup ---
+        self.pub_body_awareness_state = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_body_awareness_state = rospy.Publisher('/body_awareness_state', BodyAwarenessState, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/joint_states', JointState, self.joint_state_callback)
+            rospy.Subscriber('/force_torque_sensors', ForceTorque, self.force_torque_callback)
+            rospy.Subscriber('/tactile_sensors', TactileSensor, self.tactile_sensor_callback)
+            rospy.Subscriber('/robot_health', RobotHealth, self.robot_health_callback)
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            rospy.Subscriber('/memory_response', MemoryResponse, self.memory_response_callback)
+            rospy.Subscriber('/internal_narrative', InternalNarrative, self.internal_narrative_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.analysis_interval), self._run_body_analysis_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._shutdown_flag = threading.Event()
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+        # Initial publish
+        self.publish_body_awareness_state(None)
+
+    def _create_sensory_placeholder(self, sensor_type: str):
+        def placeholder_callback(data: Any):
+            timestamp = time.time()
+            processed_data = data if isinstance(data, dict) else {'raw': str(data)}
+            # Simulate sensor data influencing body awareness
+            if sensor_type == 'vision':
+                self.recent_joint_states.append({'timestamp': timestamp, 'positions': [random.uniform(-1,1) for _ in range(6)], 'salience_score': random.uniform(0.1, 0.4)})
+            elif sensor_type == 'sound':
+                self.recent_tactile_sensor_data.append({'timestamp': timestamp, 'pressure_sum': random.uniform(0, 10), 'salience_score': random.uniform(0.2, 0.5)})
+            elif sensor_type == 'instructions':
+                self.recent_cognitive_directives.append({'timestamp': timestamp, 'directive_type': 'BodyCheck', 'urgency': random.uniform(0.3, 0.7)})
+            self._update_cumulative_salience(0.15)  # Sensory adds to body salience
+            _log_debug(self.node_name, f"{sensor_type} input updated at {timestamp}")
+        return placeholder_callback
+
+    def _dynamic_execution_loop(self):
+        """Dynamic polling loop when ROS is disabled."""
+        while not self._shutdown_flag.is_set():
+            self._run_body_analysis_wrapper(None)
+            time.sleep(self.analysis_interval)
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    # --- Asyncio Thread Management ---
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._create_async_session())
+        self._async_loop.run_forever()
+
+    async def _create_async_session(self):
+        _log_info(self.node_name, "Creating aiohttp ClientSession...")
+        self._async_session = aiohttp.ClientSession()
+        _log_info(self.node_name, "aiohttp ClientSession created.")
+
+    async def _close_async_session(self):
+        if self._async_session:
+            _log_info(self.node_name, "Closing aiohttp ClientSession...")
+            await self._async_session.close()
+            self._async_session = None
+            _log_info(self.node_name, "aiohttp ClientSession closed.")
+
+    def _shutdown_async_loop(self):
+        if self._async_loop and self._async_thread.is_alive():
+            _log_info(self.node_name, "Shutting down asyncio loop...")
+            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)
+            try:
+                future.result(timeout=5.0)
+            except asyncio.TimeoutError:
+                _log_warn(self.node_name, "Timeout waiting for async session to close.")
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._async_thread.join(timeout=5.0)
+            if self._async_thread.is_alive():
+                _log_warn(self.node_name, "Asyncio thread did not shut down gracefully.")
+            _log_info(self.node_name, "Asyncio loop shut down.")
+
+    def _run_body_analysis_wrapper(self, event: Any = None):
+        """Wrapper to run the async body awareness analysis from a ROS timer."""
+        if self.active_llm_task and not self.active_llm_task.done():
+            _log_debug(self.node_name, "LLM body analysis task already active. Skipping new cycle.")
+            return
+        
+        # Schedule the async task
+        self.active_llm_task = asyncio.run_coroutine_threadsafe(
+            self.analyze_body_state_async(event), self._async_loop
+        )
+
+    # --- Error Reporting Utility ---
+    def _report_error(self, error_type: str, description: str, severity: float = 0.5, context: Optional[Dict] = None):
+        timestamp = str(self._get_current_time())
+        error_msg_data = {
+            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,
+            'description': description, 'severity': severity, 'context': context or {}
+        }
+        if ROS_AVAILABLE and self.ros_enabled and self.pub_error_report:
+            try:
+                self.pub_error_report.publish(String(data=json.dumps(error_msg_data)))
+                rospy.logerr(f"{self.node_name}: REPORTED ERROR: {error_type} - {description}")
+            except Exception as e:
+                _log_error(self.node_name, f"Failed to publish error report: {e}")
+        else:
+            _log_error(self.node_name, f"REPORTED ERROR: {error_type} - {description} (Severity: {severity})")
+
+    # --- LLM Call Function ---
+    async def _call_llm_api(self, prompt_text: str, response_schema: Optional[Dict] = None, temperature: float = 0.3, max_tokens: int = 300) -> str:
+        """
+        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).
+        Can optionally request a structured JSON response.
+        """
+        if not self._async_session:
+            await self._create_async_session()
+            if not self._async_session:
+                self._report_error("LLM_SESSION_ERROR", "aiohttp session not available for LLM call.", 0.8)
+                return "Error: LLM session not ready."
+
+        payload = {
+            "model": self.llm_model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": temperature,  # Low temperature for factual/reasoning tasks
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        if response_schema:
+            prompt_text += "\n\nProvide the response in JSON format according to this schema:\n" + json.dumps(response_schema, indent=2)
+            payload["messages"] = [{"role": "user", "content": prompt_text}]
+
+        api_url = self.llm_base_url
+
+        try:
+            async with self._async_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=self.llm_timeout), headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                if result.get('choices') and result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
+                    return result['choices'][0]['message']['content']
+                
+                self._report_error("LLM_RESPONSE_EMPTY", "LLM response had no content from local server.", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})
+                return "Error: LLM response empty."
+        except aiohttp.ClientError as e:
+            self._report_error("LLM_API_ERROR", f"LLM API request failed (aiohttp ClientError to local server): {e}", 0.9, {'url': api_url})
+            return f"Error: LLM API request failed: {e}"
+        except asyncio.TimeoutError:
+            self._report_error("LLM_TIMEOUT", f"LLM API request timed out after {self.llm_timeout} seconds (local server).", 0.8, {'prompt_snippet': prompt_text[:100]})
+            return "Error: LLM API request timed out."
+        except json.JSONDecodeError:
+            self._report_error("LLM_JSON_PARSE_ERROR", "Failed to parse local LLM response JSON.", 0.7)
+            return "Error: Failed to parse LLM response."
+        except Exception as e:
+            self._report_error("UNEXPECTED_LLM_ERROR", f"An unexpected error occurred during local LLM call: {e}", 0.9, {'prompt_snippet': prompt_text[:100]})
+            return f"Error: An unexpected error occurred: {e}"
+
+    # --- Utility to accumulate input salience ---
+    def _update_cumulative_salience(self, score: float):
+        """Accumulates salience from new inputs for triggering LLM analysis."""
+        self.cumulative_body_salience += score
+        self.cumulative_body_salience = min(1.0, self.cumulative_body_salience)
+
+    # --- Pruning old history ---
+    def _prune_history(self):
+        """Removes old entries from history deques based on recent_context_window_s."""
+        current_time = self._get_current_time()
+        for history_deque in [
+            self.recent_joint_states, self.recent_force_torques, self.recent_tactile_sensor_data,
+            self.recent_robot_health_states, self.recent_cognitive_directives,
+            self.recent_memory_responses, self.recent_internal_narratives
+        ]:
+            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:
+                history_deque.popleft()
+
+    # --- Callbacks (generic, ROS or direct) ---
+    def joint_state_callback(self, msg: Any):
+        # NOTE: Standard sensor_msgs/JointState doesn't have a 'timestamp' attribute directly on the message,
+        # but in ROS it has a header with stamp. Assuming message converted to dictionary or has direct attributes.
+        # If using actual sensor_msgs.msg.JointState, adjust 'timestamp' access (e.g., msg.header.stamp.to_sec())
+        fields_map = {
+            'header.stamp': (str(self._get_current_time()), 'timestamp'),  # Accessing header.stamp, assuming parsed
+            'name': ([], 'joint_names'),  # List of joint names
+            'position': ([], 'positions'),  # List of joint positions
+            'velocity': ([], 'velocities'),  # List of joint velocities
+            'effort': ([], 'efforts')  # List of joint efforts
+        }
+        # Special handling for JointState if it's not a String message.
+        # If it's a real JointState message, its structure needs direct attribute access.
+        # For simplicity, if it's String fallback, it's JSON.
+        if hasattr(msg, 'data') and isinstance(msg.data, str):
+            data = parse_message_data(msg, fields_map, self.node_name)
+        else:  # Assume actual JointState message type
+            # Directly access attributes of JointState message
+            data = {
+                'timestamp': str(msg.header.stamp.to_sec()) if hasattr(msg, 'header') else str(self._get_current_time()),
+                'joint_names': msg.name if hasattr(msg, 'name') else [],
+                'positions': msg.position if hasattr(msg, 'position') else [],
+                'velocities': msg.velocity if hasattr(msg, 'velocity') else [],
+                'efforts': msg.effort if hasattr(msg, 'effort') else []
+            }
+        
+        # Calculate a simple 'salience' for joint state changes (e.g., high velocity/effort indicates activity)
+        # This is a heuristic; real salience might need more sophisticated models.
+        salience = 0.0
+        if 'velocities' in data:
+            salience += sum([abs(v) for v in data['velocities']]) * 0.05
+        if 'efforts' in data:
+            salience += sum([abs(e) for e in data['efforts']]) * 0.02
+        data['salience_score'] = min(1.0, salience)  # Clamp salience
+
+        self.recent_joint_states.append(data)
+        self._update_cumulative_salience(data['salience_score'] * 0.3)
+        _log_debug(self.node_name, f"Received Joint State (Activity Salience: {data['salience_score']:.2f}).")
+
+    def force_torque_callback(self, msg: Any):
+        # Assuming ForceTorque message has 'header.stamp', 'wrench.force.x', 'wrench.torque.x' etc.
+        fields_map = {
+            'header.stamp': (str(self._get_current_time()), 'timestamp'),
+            'wrench.force.x': (0.0, 'force_x'), 'wrench.force.y': (0.0, 'force_y'), 'wrench.force.z': (0.0, 'force_z'),
+            'wrench.torque.x': (0.0, 'torque_x'), 'wrench.torque.y': (0.0, 'torque_y'), 'wrench.torque.z': (0.0, 'torque_z')
+        }
+        if hasattr(msg, 'data') and isinstance(msg.data, str):
+            data = parse_message_data(msg, fields_map, self.node_name)
+        else:  # Assume actual ForceTorque message type (e.g., geometry_msgs/WrenchStamped)
+            data = {
+                'timestamp': str(msg.header.stamp.to_sec()) if hasattr(msg, 'header') else str(self._get_current_time()),
+                'force_x': msg.wrench.force.x if hasattr(msg, 'wrench') else 0.0,
+                'force_y': msg.wrench.force.y if hasattr(msg, 'wrench') else 0.0,
+                'force_z': msg.wrench.force.z if hasattr(msg, 'wrench') else 0.0,
+                'torque_x': msg.wrench.torque.x if hasattr(msg, 'wrench') else 0.0,
+                'torque_y': msg.wrench.torque.y if hasattr(msg, 'wrench') else 0.0,
+                'torque_z': msg.wrench.torque.z if hasattr(msg, 'wrench') else 0.0
+            }
+
+        salience = 0.0
+        # High force/torque indicates interaction or impact
+        if 'force_x' in data:
+            salience += abs(data['force_x']) * 0.1
+        if 'force_y' in data:
+            salience += abs(data['force_y']) * 0.1
+        if 'force_z' in data:
+            salience += abs(data['force_z']) * 0.1
+        data['salience_score'] = min(1.0, salience * 0.5)  # Clamp and scale
+
+        self.recent_force_torques.append(data)
+        self._update_cumulative_salience(data['salience_score'] * 0.5)  # Force/torque implies significant interaction
+        _log_debug(self.node_name, f"Received Force/Torque data (Salience: {data['salience_score']:.2f}).")
+
+    def tactile_sensor_callback(self, msg: Any):
+        # Assuming TactileSensor message has 'timestamp', 'contact_points_json', 'pressure_sum', 'num_contacts'
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'),
+            'contact_points_json': ('[]', 'contact_points_json'),
+            'pressure_sum': (0.0, 'pressure_sum'),
+            'num_contacts': (0, 'num_contacts')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('contact_points_json'), str):
+            try:
+                data['contact_points'] = json.loads(data['contact_points_json'])
+            except json.JSONDecodeError:
+                data['contact_points'] = []
+
+        salience = data.get('pressure_sum', 0.0) * 0.3 + data.get('num_contacts', 0) * 0.1
+        data['salience_score'] = min(1.0, salience)  # Clamp salience
+
+        self.recent_tactile_sensor_data.append(data)
+        self._update_cumulative_salience(data['salience_score'] * 0.4)  # Tactile input implies physical interaction
+        _log_debug(self.node_name, f"Received Tactile Sensor data (Contacts: {data['num_contacts']}, Pressure: {data['pressure_sum']:.2f}).")
+
+    def robot_health_callback(self, msg: Any):
+        # Assuming RobotHealth message has 'timestamp', 'overall_status', 'battery_level', 'motor_temps_json', 'error_flags_json'
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'),
+            'overall_status': ('normal', 'overall_status'),
+            'battery_level': (100.0, 'battery_level'),
+            'motor_temps_json': ('{}', 'motor_temps_json'),
+            'error_flags_json': ('{}', 'error_flags_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('motor_temps_json'), str):
+            try:
+                data['motor_temps'] = json.loads(data['motor_temps_json'])
+            except json.JSONDecodeError:
+                data['motor_temps'] = {}
+        if isinstance(data.get('error_flags_json'), str):
+            try:
+                data['error_flags'] = json.loads(data['error_flags_json'])
+            except json.JSONDecodeError:
+                data['error_flags'] = {}
+
+        salience = 0.0
+        if data.get('overall_status') == 'critical':
+            salience = 1.0
+        elif data.get('overall_status') == 'warning':
+            salience = 0.7
+        if data.get('battery_level', 100.0) < 20.0:
+            salience = max(salience, 0.6)
+        if data.get('error_flags'):  # If any error flags are true
+            if any(data['error_flags'].values()):
+                salience = max(salience, 0.8)
+        data['salience_score'] = min(1.0, salience)
+
+        self.recent_robot_health_states.append(data)
+        self._update_cumulative_salience(data['salience_score'] * 0.9)  # Health issues are high priority
+        _log_debug(self.node_name, f"Received Robot Health State (Status: {data['overall_status']}, Salience: {data['salience_score']:.2f}).")
+
+    def cognitive_directive_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),
+            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),
+            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        
+        if data.get('target_node') == self.node_name:
+            self.recent_cognitive_directives.append(data)  # Add directives for self to context
+            # Directives for body integrity checks or specific posture adjustments are highly salient
+            if data.get('directive_type') in ['CheckBodyIntegrity', 'AdjustPosture']:
+                self._update_cumulative_salience(data.get('urgency', 0.0) * 0.9)
+            _log_info(self.node_name, f"Received directive for self: '{data.get('directive_type', 'N/A')}' (Payload: {data.get('command_payload', 'N/A')}.)")
+        else:
+            self.recent_cognitive_directives.append(data)  # Add all directives for general context
+        _log_debug(self.node_name, "Cognitive Directive received for context/action.")
+
+    def memory_response_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'request_id': ('', 'request_id'),
+            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('memories_json'), str):
+            try:
+                data['memories']
+```

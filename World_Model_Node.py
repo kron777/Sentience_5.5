@@ -1,1 +1,737 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique entity IDs or state update IDs\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        WorldModelState,        # Output: Robot's current understanding of the world\n        SensoryQualia,          # Input: Processed sensory data (updates world model)\n        MemoryResponse,         # Input: Retrieved spatial maps, object definitions, past world states\n        CognitiveDirective,     # Input: Directives for world model updates or consistency checks\n        AttentionState,         # Input: Current attention focus (influences what details to prioritize)\n        PredictionState         # Input: Predicted events (can be used to update future world states)\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in World Model Node.\")\n    WorldModelState = String\n    SensoryQualia = String\n    MemoryResponse = String\n    CognitiveDirective = String\n    AttentionState = String\n    PredictionState = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'world_model_node': {\n                'model_update_interval': 0.2, # How often to update world model\n                'llm_update_threshold_salience': 0.6, # Cumulative salience to trigger LLM\n                'recent_context_window_s': 5.0 # Window for deques for LLM context (short for dynamic world)\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 20.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass WorldModelNode:\n    def __init__(self):\n        rospy.init_node('world_model_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"world_model_log.db\")\n        self.model_update_interval = self.params.get('model_update_interval', 0.2) # How often to update model\n        self.llm_update_threshold_salience = self.params.get('llm_update_threshold_salience', 0.6) # Salience to trigger LLM\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0) # Context window for LLM\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 20.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'world_model_snapshots' table if it doesn't exist.\n        # NEW: Added 'llm_consistency_notes', 'input_qualia_hashes'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS world_model_snapshots (\n                id TEXT PRIMARY KEY,            -- Unique snapshot ID (UUID)\n                timestamp TEXT,\n                num_entities INTEGER,           -- Total number of recognized entities\n                entities_json TEXT,             -- JSON array of entities and their properties\n                changed_entities_json TEXT,     -- JSON array of entities whose state recently changed\n                significant_change_flag BOOLEAN,-- True if the world model experienced a significant change\n                consistency_score REAL,         -- How consistent the current model is (0.0 to 1.0)\n                llm_consistency_notes TEXT,     -- NEW: LLM's notes on consistency checking/updates\n                input_qualia_hashes TEXT        -- NEW: Comma-separated hashes of SensoryQualia used for this update\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_world_timestamp ON world_model_snapshots (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.current_world_model = {\n            'timestamp': str(rospy.get_time()),\n            'num_entities': 0,\n            'entities': [], # List of objects: {'id': 'obj1', 'type': 'chair', 'position': [x,y,z], 'status': 'static'}\n            'changed_entities': [],\n            'significant_change_flag': False,\n            'consistency_score': 1.0\n        }\n\n        # Deques to maintain a short history of inputs relevant to world model updates\n        self.recent_sensory_qualia = deque(maxlen=10) # Primary input for updates\n        self.recent_memory_responses = deque(maxlen=5) # For known objects, maps, historical context\n        self.recent_cognitive_directives = deque(maxlen=3) # Directives for world model validation\n        self.recent_attention_states = deque(maxlen=3) # Attention focus can prioritize updates\n        self.recent_prediction_states = deque(maxlen=3) # Predicted changes (can be confirmed/denied)\n\n        self.cumulative_world_model_salience = 0.0 # Aggregated salience to trigger LLM update\n\n        # --- Publishers ---\n        self.pub_world_model_state = rospy.Publisher('/world_model_state', WorldModelState, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # To request memory or other nodes\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/sensory_qualia', SensoryQualia, self.sensory_qualia_callback)\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n        rospy.Subscriber('/attention_state', AttentionState, self.attention_state_callback)\n        rospy.Subscriber('/prediction_state', String, self.prediction_state_callback) # Stringified JSON\n\n\n        # --- Timer for periodic world model updates ---\n        rospy.Timer(rospy.Duration(self.model_update_interval), self._run_world_model_update_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's world model system online, establishing perception of reality.\")\n        # Publish initial state\n        self.publish_world_model_state(None)\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_world_model_update_wrapper(self, event):\n        \"\"\"Wrapper to run the async world model update from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM world model update task already active. Skipping new cycle.\")\n            return\n        \n        # Schedule the async task\n        self.active_llm_task = asyncio.run_coroutine_threadsafe(\n            self.update_world_model_async(event), self._async_loop\n        )\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.1, max_tokens=None):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response. Low temperature for factual consistency.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        actual_max_tokens = max_tokens if max_tokens is not None else 500 # Higher max_tokens for complex updates\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Low temperature for factual consistency\n            \"max_tokens\": actual_max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0]['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM update.\"\"\"\n        self.cumulative_world_model_salience += score\n        self.cumulative_world_model_salience = min(1.0, self.cumulative_world_model_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_sensory_qualia, self.recent_memory_responses,\n            self.recent_cognitive_directives, self.recent_attention_states,\n            self.recent_prediction_states\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def sensory_qualia_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'qualia_id': ('', 'qualia_id'),\n            'qualia_type': ('none', 'qualia_type'), 'modality': ('none', 'modality'),\n            'description_summary': ('', 'description_summary'), 'salience_score': (0.0, 'salience_score'),\n            'raw_data_hash': ('', 'raw_data_hash')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_sensory_qualia.append(data)\n        # High salience sensory input directly indicates potential world changes\n        self._update_cumulative_salience(data.get('salience_score', 0.0) * 0.8)\n        rospy.logdebug(f\"{self.node_name}: Received Sensory Qualia. Description: {data.get('description_summary', 'N/A')}.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        # Recalled maps or object definitions are crucial for updating the world model\n        if data.get('response_code', 0) == 200 and data.get('memories'):\n            if any('map_data' in mem.get('category', '') or 'object_definition' in mem.get('category', '') for mem in data['memories']):\n                self._update_cumulative_salience(0.4)\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name and data.get('directive_type') == 'UpdateWorldModel':\n            try:\n                payload = json.loads(data.get('command_payload', '{}'))\n                self._update_cumulative_salience(data.get('urgency', 0.0) * 1.0) # High urgency for direct update directives\n                rospy.loginfo(f\"{self.node_name}: Received directive to update world model based on reason: '{data.get('reason', 'N/A')}'.\")\n            except json.JSONDecodeError as e:\n                self._report_error(\"JSON_DECODE_ERROR\", f\"Failed to decode command_payload in CognitiveDirective: {e}\", 0.5, {'payload': data.get('command_payload')})\n            except Exception as e:\n                self._report_error(\"DIRECTIVE_PROCESSING_ERROR\", f\"Error processing CognitiveDirective for world model: {e}\", 0.7, {'directive': data})\n        \n        self.recent_cognitive_directives.append(data) # Store all directives for context\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    def attention_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'focus_type': ('idle', 'focus_type'),\n            'focus_target': ('environment', 'focus_target'), 'priority_score': (0.0, 'priority_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_attention_states.append(data)\n        # What the robot is attending to should be reflected in the world model's granularity for that area/object\n        if data.get('priority_score', 0.0) > 0.5:\n            self._update_cumulative_salience(data.get('priority_score', 0.0) * 0.2)\n        rospy.logdebug(f\"{self.node_name}: Received Attention State. Focus: {data.get('focus_target', 'N/A')}.\")\n\n    def prediction_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'predicted_event': ('', 'predicted_event'),\n            'prediction_confidence': (0.0, 'prediction_confidence'), 'prediction_accuracy': (0.0, 'prediction_accuracy'),\n            'urgency_flag': (False, 'urgency_flag')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_prediction_states.append(data)\n        # Predicted changes in the world should prompt the world model to verify or pre-emptively update\n        if data.get('urgency_flag', False) and data.get('prediction_confidence', 0.0) > 0.7:\n            self._update_cumulative_salience(0.6)\n        rospy.logdebug(f\"{self.node_name}: Received Prediction State. Event: {data.get('predicted_event', 'N/A')}.\")\n\n    # --- Core World Model Update Logic (Async with LLM) ---\n    async def update_world_model_async(self, event):\n        \"\"\"\n        Asynchronously updates the robot's internal world model based on recent sensory qualia\n        and other cognitive inputs, using LLM for complex scene understanding and consistency.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        current_world_model_snapshot = dict(self.current_world_model) # Make a copy for LLM context\n        current_world_model_snapshot['entities_json'] = json.dumps(current_world_model_snapshot['entities'])\n        current_world_model_snapshot['changed_entities_json'] = json.dumps(current_world_model_snapshot['changed_entities'])\n        del current_world_model_snapshot['entities']\n        del current_world_model_snapshot['changed_entities']\n\n        num_entities = self.current_world_model.get('num_entities', 0)\n        entities = self.current_world_model.get('entities', [])\n        changed_entities = []\n        significant_change_flag = False\n        consistency_score = self.current_world_model.get('consistency_score', 1.0)\n        llm_consistency_notes = \"No LLM update.\"\n        input_qualia_hashes = []\n\n        # Collect hashes of sensory qualia used for this update\n        for qualia in self.recent_sensory_qualia:\n            input_qualia_hashes.append(qualia.get('raw_data_hash', ''))\n        input_qualia_hashes_str = ','.join(input_qualia_hashes)\n\n        if self.cumulative_world_model_salience >= self.llm_update_threshold_salience:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for world model update (Salience: {self.cumulative_world_model_salience:.2f}).\")\n            \n            context_for_llm = self._compile_llm_context_for_world_model(current_world_model_snapshot)\n            llm_world_model_output = await self._update_world_model_llm(context_for_llm)\n\n            if llm_world_model_output:\n                num_entities = llm_world_model_output.get('num_entities', len(entities))\n                updated_entities = llm_world_model_output.get('updated_entities', []) # LLM returns only changed/new\n                # Merge updated_entities into the current world model entities\n                new_entities_map = {e['id']: e for e in entities}\n                for u_entity in updated_entities:\n                    new_entities_map[u_entity['id']] = u_entity\n                entities = list(new_entities_map.values())\n                \n                changed_entities = llm_world_model_output.get('changed_entities', [])\n                significant_change_flag = llm_world_model_output.get('significant_change_flag', False)\n                consistency_score = max(0.0, min(1.0, llm_world_model_output.get('consistency_score', consistency_score)))\n                llm_consistency_notes = llm_world_model_output.get('llm_consistency_notes', 'LLM updated world model.')\n                \n                rospy.loginfo(f\"{self.node_name}: LLM World Model Update. Entities: {num_entities}. Significant Change: {significant_change_flag}. Consistency: {consistency_score:.2f}.\")\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM world model update failed. Applying simple fallback.\")\n                entities, changed_entities, num_entities, significant_change_flag, consistency_score = self._apply_simple_world_model_rules()\n                llm_consistency_notes = \"Fallback to simple rules due to LLM failure.\"\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_world_model_salience:.2f}) for LLM world model update. Applying simple rules.\")\n            entities, changed_entities, num_entities, significant_change_flag, consistency_score = self._apply_simple_world_model_rules()\n            llm_consistency_notes = \"Fallback to simple rules due to low salience.\"\n\n        self.current_world_model = {\n            'timestamp': str(rospy.get_time()),\n            'num_entities': len(entities), # Recalculate based on merged list\n            'entities': entities,\n            'changed_entities': changed_entities,\n            'significant_change_flag': significant_change_flag,\n            'consistency_score': consistency_score\n        }\n\n        self.save_world_model_log(\n            id=str(uuid.uuid4()),\n            timestamp=self.current_world_model['timestamp'],\n            num_entities=self.current_world_model['num_entities'],\n            entities_json=json.dumps(self.current_world_model['entities']),\n            changed_entities_json=json.dumps(self.current_world_model['changed_entities']),\n            significant_change_flag=self.current_world_model['significant_change_flag'],\n            consistency_score=self.current_world_model['consistency_score'],\n            llm_consistency_notes=llm_consistency_notes,\n            input_qualia_hashes=input_qualia_hashes_str,\n            context_snapshot_json=json.dumps(self._compile_llm_context_for_world_model(current_world_model_snapshot))\n        )\n        self.publish_world_model_state(None) # Publish updated state\n        self.cumulative_world_model_salience = 0.0 # Reset after update\n\n    async def _update_world_model_llm(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to update the robot's world model based on new sensory data\n        and maintain consistency.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the World Model Module of a robot's cognitive architecture, powered by a large language model. Your crucial role is to maintain an accurate and consistent understanding of the robot's environment. You must update the `current_world_model` based on recent `sensory_qualia` and other `cognitive_context`, identifying `changed_entities`, and assessing `consistency`.\n\n        Robot's Current World Model (State before update):\n        --- Current World Model ---\n        {json.dumps(context_for_llm.get('current_world_model', {}), indent=2)}\n\n        Recent Sensory Input to Integrate:\n        --- Recent Sensory Qualia ---\n        {json.dumps(context_for_llm.get('recent_sensory_qualia', []), indent=2)}\n\n        Robot's Current Cognitive Context (for guiding update process):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm.get('cognitive_context', {}), indent=2)}\n\n        Based on this, provide:\n        1.  `num_entities`: integer (The total count of entities in the *entire updated* world model.)\n        2.  `updated_entities`: array of objects (A list of ONLY the entities that are new, have changed properties, or whose status has been updated. Each object should have 'id', 'type', 'position', 'status', 'properties' (as JSON object, e.g., {'color': 'red', 'size': 'medium'}). If an entity is no longer perceived, it should be marked with status 'vanished'.)\n        3.  `changed_entities`: array of objects (A subset of `updated_entities` focusing on objects that have had a *significant* change (e.g., moved, appeared, disappeared, changed critical state). Provide full object details.)\n        4.  `significant_change_flag`: boolean (True if there was any notable change in the environment that warrants higher attention, False otherwise.)\n        5.  `consistency_score`: number (0.0 to 1.0, how consistent the new world model is with previous states and expectations. Lower score for contradictions or highly unexpected observations.)\n        6.  `llm_consistency_notes`: string (Detailed explanation for your update process, how conflicts were resolved, and why certain changes are considered significant.)\n\n        Consider:\n        -   **Sensory Qualia**: Integrate new `description_summary`, `modality`, and `salience_score` from recent perceptions.\n        -   **Memory Responses**: Are there `known_object_definitions` or `spatial_maps` that help categorize or locate entities?\n        -   **Cognitive Directives**: Was there a directive to `UpdateWorldModel` or `ValidateWorldModel` regarding a specific area or object?\n        -   **Attention State**: Is the `attention_focus_target` affecting how precisely certain objects are updated?\n        -   **Prediction State**: Did any `predicted_event` occur? Confirm or deny its impact on the world model. How does the current state affect future `predictions`?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'num_entities': integer\n        3.  'updated_entities': array\n        4.  'changed_entities': array\n        5.  'significant_change_flag': boolean\n        6.  'consistency_score': number\n        7.  'llm_consistency_notes': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"num_entities\": {\"type\": \"integer\", \"minimum\": 0},\n                \"updated_entities\": {\n                    \"type\": \"array\",\n                    \"items\": {\n                        \"type\": \"object\",\n                        \"properties\": {\n                            \"id\": {\"type\": \"string\"},\n                            \"type\": {\"type\": \"string\"},\n                            \"position\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}, \"minItems\": 3, \"maxItems\": 3},\n                            \"status\": {\"type\": \"string\"},\n                            \"properties\": {\"type\": \"object\"}\n                        },\n                        \"required\": [\"id\", \"type\", \"position\", \"status\", \"properties\"]\n                    }\n                },\n                \"changed_entities\": {\n                    \"type\": \"array\",\n                    \"items\": {\n                        \"type\": \"object\", # Similar to updated_entities\n                        \"properties\": {\n                            \"id\": {\"type\": \"string\"},\n                            \"type\": {\"type\": \"string\"},\n                            \"position\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}, \"minItems\": 3, \"maxItems\": 3},\n                            \"status\": {\"type\": \"string\"},\n                            \"properties\": {\"type\": \"object\"}\n                        },\n                        \"required\": [\"id\", \"type\", \"position\", \"status\", \"properties\"]\n                    }\n                },\n                \"significant_change_flag\": {\"type\": \"boolean\"},\n                \"consistency_score\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0},\n                \"llm_consistency_notes\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"num_entities\", \"updated_entities\", \"changed_entities\", \"significant_change_flag\", \"consistency_score\", \"llm_consistency_notes\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.1, max_tokens=600)\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure numerical/boolean fields are floats/booleans\n                if 'num_entities' in llm_data: llm_data['num_entities'] = int(llm_data['num_entities'])\n                if 'significant_change_flag' in llm_data: llm_data['significant_change_flag'] = bool(llm_data['significant_change_flag'])\n                if 'consistency_score' in llm_data: llm_data['consistency_score'] = float(llm_data['consistency_score'])\n                \n                # Ensure nested numbers are floats\n                for entity_list_key in ['updated_entities', 'changed_entities']:\n                    if entity_list_key in llm_data:\n                        for entity in llm_data[entity_list_key]:\n                            if 'position' in entity: entity['position'] = [float(p) for p in entity['position']]\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for world model: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_WORLD_MODEL_UPDATE_FAILED\", f\"LLM call failed for world model update: {llm_output_str}\", 0.9)\n            return None\n\n    def _apply_simple_world_model_rules(self):\n        \"\"\"\n        Fallback mechanism to update the world model using simple rule-based logic\n        if LLM is not triggered or fails.\n        \"\"\"\n        current_time = rospy.get_time()\n        \n        updated_entities_list = list(self.current_world_model.get('entities', []))\n        changed_entities_list = []\n        significant_change = False\n        consistency = 1.0\n\n        # Rule 1: Integrate new entities from sensory qualia (simple object detection)\n        for qualia in self.recent_sensory_qualia:\n            time_since_qualia = current_time - float(qualia.get('timestamp', 0.0))\n            if time_since_qualia < 1.0 and qualia.get('qualia_type') == 'visual_object_detection':\n                # This is a very simplistic integration; would need more robust object tracking\n                detected_object_type = qualia.get('description_summary', 'unidentified_object').replace('Visually detected: ', '')\n                # Check if object already exists, if not add\n                if not any(e.get('type') == detected_object_type and e.get('status') != 'vanished' for e in updated_entities_list):\n                    new_entity_id = f\"{detected_object_type}_{str(uuid.uuid4())[:4]}\"\n                    new_entity = {\n                        'id': new_entity_id,\n                        'type': detected_object_type,\n                        'position': [random.uniform(-5,5), random.uniform(-5,5), 0], # Placeholder position\n                        'status': 'static',\n                        'properties': {'source_qualia_id': qualia['qualia_id']}\n                    }\n                    updated_entities_list.append(new_entity)\n                    changed_entities_list.append(new_entity)\n                    significant_change = True\n                    rospy.logwarn(f\"{self.node_name}: Simple rule: Added new entity '{detected_object_type}'.\")\n\n        # Rule 2: Confirm or deny predictions if supported by sensory data\n        for prediction in self.recent_prediction_states:\n            time_since_prediction = current_time - float(prediction.get('timestamp', 0.0))\n            if time_since_prediction < 1.0 and prediction.get('urgency_flag', False) and prediction.get('prediction_confidence', 0.0) > 0.8:\n                if \"obstacle\" in prediction.get('predicted_event', '').lower() and \\\n                   any(q.get('qualia_type') == 'proximity_alert' and q.get('salience_score',0.0) > 0.8 for q in self.recent_sensory_qualia if current_time - float(q.get('timestamp',0.0)) < 0.5):\n                    # Prediction confirmed by recent qualia\n                    rospy.logwarn(f\"{self.node_name}: Simple rule: Confirmed predicted obstacle.\")\n                    # In a real system, would update obstacle's position/status\n                elif \"human approaching\" in prediction.get('predicted_event', '').lower() and \\\n                     any(q.get('description_summary') == \"Detected a human figure approaching\" for q in self.recent_sensory_qualia if current_time - float(q.get('timestamp',0.0)) < 0.5):\n                    rospy.logwarn(f\"{self.node_name}: Simple rule: Confirmed predicted human approach.\")\n                    # Update human entity in world model\n\n        # Rule 3: Basic consistency check (e.g., no entities with identical IDs, or highly conflicting data)\n        # This is a very basic example; a real consistency check would be far more complex\n        entity_ids = set()\n        has_duplicate_id = False\n        for entity in updated_entities_list:\n            if entity.get('id') in entity_ids:\n                has_duplicate_id = True\n                break\n            entity_ids.add(entity.get('id'))\n        \n        if has_duplicate_id:\n            consistency = 0.5 # Reduced if duplicates found\n            rospy.logwarn(f\"{self.node_name}: Simple rule: Detected inconsistency (duplicate entity IDs).\")\n            # In a real system, this might trigger a more robust merging or conflict resolution.\n\n        num_entities = len(updated_entities_list)\n        return updated_entities_list, changed_entities_list, num_entities, significant_change, consistency\n\n\n    def _compile_llm_context_for_world_model(self, current_world_model_snapshot):\n        \"\"\"\n        Gathers and formats all relevant cognitive state data for the LLM's\n        world model update.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"current_world_model\": current_world_model_snapshot, # Sent as JSON string for LLM\n            \"recent_sensory_qualia\": list(self.recent_sensory_qualia),\n            \"recent_cognitive_inputs\": {\n                \"memory_responses\": list(self.recent_memory_responses),\n                \"cognitive_directives_for_self\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name],\n                \"attention_state\": self.recent_attention_states[-1] if self.recent_attention_states else \"N/A\",\n                \"prediction_state\": self.recent_prediction_states[-1] if self.recent_prediction_states else \"N/A\"\n            }\n        }\n        \n        # Deep parse any nested JSON strings in context for better LLM understanding\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            for i, item in enumerate(context[\"recent_cognitive_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try:\n                                item[field] = json.loads(value)\n                            except json.JSONDecodeError:\n                                pass # Keep as string if not valid JSON\n\n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_world_model_log(self, id, timestamp, num_entities, entities_json, changed_entities_json, significant_change_flag, consistency_score, llm_consistency_notes, input_qualia_hashes, context_snapshot_json):\n        \"\"\"Saves a world model snapshot entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO world_model_snapshots (id, timestamp, num_entities, entities_json, changed_entities_json, significant_change_flag, consistency_score, llm_consistency_notes, input_qualia_hashes, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, num_entities, entities_json, changed_entities_json, significant_change_flag, consistency_score, llm_consistency_notes, input_qualia_hashes, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved world model snapshot (ID: {id}, Entities: {num_entities}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save world model log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_world_model_log: {e}\", 0.9)\n\n\n    def publish_world_model_state(self, event):\n        \"\"\"Publishes the robot's current world model state.\"\"\"\n        timestamp = str(rospy.get_time())\n        # Update timestamp before publishing\n        self.current_world_model['timestamp'] = timestamp\n        \n        try:\n            if isinstance(WorldModelState, type(String)): # Fallback to String message\n                # Ensure entities are JSON string\n                temp_model = dict(self.current_world_model)\n                temp_model['entities_json'] = json.dumps(temp_model['entities'])\n                temp_model['changed_entities_json'] = json.dumps(temp_model['changed_entities'])\n                del temp_model['entities']\n                del temp_model['changed_entities']\n                self.pub_world_model_state.publish(json.dumps(temp_model))\n            else:\n                world_model_msg = WorldModelState()\n                world_model_msg.timestamp = timestamp\n                world_model_msg.num_entities = self.current_world_model['num_entities']\n                world_model_msg.entities_json = json.dumps(self.current_world_model['entities'])\n                world_model_msg.changed_entities_json = json.dumps(self.current_world_model['changed_entities'])\n                world_model_msg.significant_change_flag = self.current_world_model['significant_change_flag']\n                world_model_msg.consistency_score = self.current_world_model['consistency_score']\n                self.pub_world_model_state.publish(world_model_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published World Model State. Entities: '{self.current_world_model['num_entities']}', Changed: '{len(self.current_world_model['changed_entities'])}'.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_WORLD_MODEL_STATE_ERROR\", f\"Failed to publish world model state: {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency, reason=\"\"):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency,\n                    'reason': reason\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                directive_msg.reason = reason\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to issue cognitive directive from World Model Node: {e}\")\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = WorldModelNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, WorldModelNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, WorldModelNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+```python
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random
+import uuid  # For unique entity IDs or state update IDs
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Optional, Deque, List
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading
+from collections import deque
+
+# Optional ROS Integration (for compatibility)
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    WorldModelState = ROSMsgFallback
+    SensoryQualia = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    AttentionState = ROSMsgFallback
+    PredictionState = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    WorldModelState = ROSMsgFallback
+    SensoryQualia = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    AttentionState = ROSMsgFallback
+    PredictionState = ROSMsgFallback
+
+
+# --- Import shared utility functions ---
+# Assuming 'sentience/scripts.utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        return {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,
+            'world_model_node': {
+                'model_update_interval': 0.2,
+                'llm_update_threshold_salience': 0.6,
+                'recent_context_window_s': 5.0,
+                'ethical_compassion_bias': 0.2,  # Bias toward compassionate world modeling (e.g., empathetic entity representations)
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 20.0
+            }
+        }.get(node_name, {})  # Return node-specific or empty dict
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class WorldModelNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'world_model_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized config ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "world_model_log.db")
+        self.model_update_interval = self.params.get('model_update_interval', 0.2)
+        self.llm_update_threshold_salience = self.params.get('llm_update_threshold_salience', 0.6)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0)
+        self.ethical_compassion_bias = self.params.get('ethical_compassion_bias', 0.2)
+
+        # Sensory placeholders (e.g., vision/sound influencing world model compassionately)
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+        self.vision_callback = self._create_sensory_placeholder('vision')
+        self.sound_callback = self._create_sensory_placeholder('sound')
+        self.instructions_callback = self._create_sensory_placeholder('instructions')
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 20.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Robot's world model system online, establishing compassionate perception of reality.")
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS world_model_snapshots (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                num_entities INTEGER,
+                entities_json TEXT,
+                changed_entities_json TEXT,
+                significant_change_flag BOOLEAN,
+                consistency_score REAL,
+                llm_consistency_notes TEXT,
+                input_qualia_hashes TEXT,
+                context_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_world_timestamp ON world_model_snapshots (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.current_world_model = {
+            'timestamp': str(time.time()),
+            'num_entities': 0,
+            'entities': [],  # List of objects: {'id': 'obj1', 'type': 'chair', 'position': [x,y,z], 'status': 'static'}
+            'changed_entities': [],
+            'significant_change_flag': False,
+            'consistency_score': 1.0
+        }
+
+        # History deques
+        self.recent_sensory_qualia: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self.recent_memory_responses: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_cognitive_directives: Deque[Dict[str, Any]] = deque(maxlen=3)
+        self.recent_attention_states: Deque[Dict[str, Any]] = deque(maxlen=3)
+        self.recent_prediction_states: Deque[Dict[str, Any]] = deque(maxlen=3)
+
+        self.cumulative_world_model_salience = 0.0
+
+        # --- Simulated ROS Compatibility: Conditional Setup ---
+        self.pub_world_model_state = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_world_model_state = rospy.Publisher('/world_model_state', WorldModelState, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/sensory_qualia', SensoryQualia, self.sensory_qualia_callback)
+            rospy.Subscriber('/memory_response', MemoryResponse, self.memory_response_callback)
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            rospy.Subscriber('/attention_state', AttentionState, self.attention_state_callback)
+            rospy.Subscriber('/prediction_state', PredictionState, self.prediction_state_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.model_update_interval), self._run_world_model_update_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._shutdown_flag = threading.Event()
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+        # Initial publish
+        self.publish_world_model_state(None)
+
+    def _create_sensory_placeholder(self, sensor_type: str):
+        """Dynamic placeholder for sensory inputs influencing world model compassionately."""
+        def placeholder_callback(data: Any):
+            timestamp = time.time()
+            processed = data if isinstance(data, dict) else {'raw': str(data)}
+            # Simulate sensory update to world model
+            if sensor_type == 'vision':
+                self.recent_sensory_qualia.append({
+                    'timestamp': timestamp, 'qualia_type': 'visual', 'modality': 'camera',
+                    'description_summary': processed.get('description', 'visual input'), 'salience_score': random.uniform(0.4, 0.8)
+                })
+            elif sensor_type == 'sound':
+                self.recent_sensory_qualia.append({
+                    'timestamp': timestamp, 'qualia_type': 'auditory', 'modality': 'microphone',
+                    'description_summary': processed.get('transcription', 'audio input'), 'salience_score': random.uniform(0.3, 0.7)
+                })
+            elif sensor_type == 'instructions':
+                self.recent_sensory_qualia.append({
+                    'timestamp': timestamp, 'qualia_type': 'cognitive', 'modality': 'command',
+                    'description_summary': processed.get('instruction', 'user command'), 'salience_score': random.uniform(0.5, 0.9)
+                })
+            # Compassionate bias: If distress in sound, bias toward empathetic entity updates
+            if 'distress' in str(processed):
+                self.cumulative_world_model_salience = min(1.0, self.cumulative_world_model_salience + self.ethical_compassion_bias)
+            _log_debug(self.node_name, f"{sensor_type} input updated world model context at {timestamp}")
+        return placeholder_callback
+
+    def _dynamic_execution_loop(self):
+        """Dynamic polling loop when ROS is disabled."""
+        while not self._shutdown_flag.is_set():
+            self._simulate_sensory_qualia()
+            self._simulate_memory_response()
+            self._simulate_cognitive_directive()
+            self._simulate_attention_state()
+            self._simulate_prediction_state()
+            self._run_world_model_update_wrapper(None)
+            time.sleep(self.model_update_interval)
+
+    def _simulate_sensory_qualia(self):
+        """Simulate sensory qualia in non-ROS mode."""
+        qualia_data = {'qualia_type': random.choice(['visual', 'auditory', 'tactile']), 'description_summary': 'simulated perception', 'salience_score': random.uniform(0.4, 0.8)}
+        self.sensory_qualia_callback({'data': json.dumps(qualia_data)})
+        _log_debug(self.node_name, f"Simulated sensory qualia: {json.dumps(qualia_data)}")
+
+    def _simulate_memory_response(self):
+        """Simulate memory response in non-ROS mode."""
+        memory_data = {'request_id': str(uuid.uuid4()), 'memories': [{'category': 'spatial_map', 'content': 'simulated map'}]}
+        self.memory_response_callback({'data': json.dumps(memory_data)})
+        _log_debug(self.node_name, "Simulated memory response")
+
+    def _simulate_cognitive_directive(self):
+        """Simulate cognitive directive in non-ROS mode."""
+        directive_data = {'directive_type': 'UpdateWorldModel', 'urgency': random.uniform(0.3, 0.8)}
+        self.cognitive_directive_callback({'data': json.dumps(directive_data)})
+        _log_debug(self.node_name, f"Simulated cognitive directive: {directive_data['directive_type']}")
+
+    def _simulate_attention_state(self):
+        """Simulate attention state in non-ROS mode."""
+        attention_data = {'focus_type': 'object', 'focus_target': 'person', 'priority_score': random.uniform(0.4, 0.9)}
+        self.attention_state_callback({'data': json.dumps(attention_data)})
+        _log_debug(self.node_name, f"Simulated attention state: {attention_data}")
+
+    def _simulate_prediction_state(self):
+        """Simulate prediction state in non-ROS mode."""
+        prediction_data = {'predicted_event': 'object movement', 'prediction_confidence': random.uniform(0.5, 0.9), 'urgency_flag': random.choice([True, False])}
+        self.prediction_state_callback({'data': json.dumps(prediction_data)})
+        _log_debug(self.node_name, f"Simulated prediction state: {prediction_data}")
+
+    # --- Core World Model Update Logic (Async with LLM) ---
+    async def update_world_model_async(self, event: Any = None):
+        """
+        Asynchronously updates the robot's internal world model based on recent sensory qualia
+        and other cognitive inputs, using LLM for complex scene understanding and consistency.
+        """
+        self._prune_history()  # Keep context history fresh
+
+        current_world_model_snapshot = dict(self.current_world_model)  # Make a copy for LLM context
+        current_world_model_snapshot['entities_json'] = json.dumps(current_world_model_snapshot['entities'])
+        current_world_model_snapshot['changed_entities_json'] = json.dumps(current_world_model_snapshot['changed_entities'])
+        del current_world_model_snapshot['entities']
+        del current_world_model_snapshot['changed_entities']
+
+        num_entities = self.current_world_model.get('num_entities', 0)
+        entities = self.current_world_model.get('entities', [])
+        changed_entities = []
+        significant_change_flag = False
+        consistency_score = self.current_world_model.get('consistency_score', 1.0)
+        llm_consistency_notes = "No LLM update."
+        input_qualia_hashes = []
+
+        # Collect hashes of sensory qualia used for this update
+        for qualia in self.recent_sensory_qualia:
+            input_qualia_hashes.append(qualia.get('raw_data_hash', ''))
+        input_qualia_hashes_str = ','.join(input_qualia_hashes)
+
+        if self.cumulative_world_model_salience >= self.llm_update_threshold_salience:
+            _log_info(self.node_name, f"Triggering LLM for world model update (Salience: {self.cumulative_world_model_salience:.2f}).")
+            
+            context_for_llm = self._compile_llm_context_for_world_model(current_world_model_snapshot)
+            llm_world_model_output = await self._update_world_model_llm(context_for_llm)
+
+            if llm_world_model_output:
+                num_entities = llm_world_model_output.get('num_entities', len(entities))
+                updated_entities = llm_world_model_output.get('updated_entities', [])  # LLM returns only changed/new
+                # Merge updated_entities into the current world model entities
+                new_entities_map = {e['id']: e for e in entities}
+                for u_entity in updated_entities:
+                    new_entities_map[u_entity['id']] = u_entity
+                entities = list(new_entities_map.values())
+                
+                changed_entities = llm_world_model_output.get('changed_entities', [])
+                significant_change_flag = llm_world_model_output.get('significant_change_flag', False)
+                consistency_score = max(0.0, min(1.0, llm_world_model_output.get('consistency_score', consistency_score)))
+                llm_consistency_notes = llm_world_model_output.get('llm_consistency_notes', 'LLM updated world model.')
+                _log_info(self.node_name, f"LLM World Model Update. Entities: {num_entities}. Significant Change: {significant_change_flag}. Consistency: {consistency_score:.2f}.")
+            else:
+                _log_warn(self.node_name, "LLM world model update failed. Applying simple fallback.")
+                entities, changed_entities, num_entities, significant_change_flag, consistency_score = self._apply_simple_world_model_rules()
+                llm_consistency_notes = "Fallback to simple rules due to LLM failure."
+        else:
+            _log_debug(self.node_name, f"Insufficient cumulative salience ({self.cumulative_world_model_salience:.2f}) for LLM world model update. Applying simple rules.")
+            entities, changed_entities, num_entities, significant_change_flag, consistency_score = self._apply_simple_world_model_rules()
+            llm_consistency_notes = "Fallback to simple rules due to low salience."
+
+        self.current_world_model = {
+            'timestamp': str(self._get_current_time()),
+            'num_entities': len(entities),  # Recalculate based on merged list
+            'entities': entities,
+            'changed_entities': changed_entities,
+            'significant_change_flag': significant_change_flag,
+            'consistency_score': consistency_score
+        }
+
+        # Sensory snapshot for logging
+        sensory_snapshot = json.dumps(self.sensory_data)
+        self.save_world_model_log(
+            id=str(uuid.uuid4()),
+            timestamp=self.current_world_model['timestamp'],
+            num_entities=self.current_world_model['num_entities'],
+            entities_json=json.dumps(self.current_world_model['entities']),
+            changed_entities_json=json.dumps(self.current_world_model['changed_entities']),
+            significant_change_flag=significant_change_flag,
+            consistency_score=consistency_score,
+            llm_consistency_notes=llm_consistency_notes,
+            input_qualia_hashes=input_qualia_hashes_str,
+            context_snapshot_json=json.dumps(self._compile_llm_context_for_world_model(current_world_model_snapshot)),
+            sensory_snapshot_json=sensory_snapshot
+        )
+        self.publish_world_model_state(None)  # Publish updated state
+        self.cumulative_world_model_salience = 0.0  # Reset after update
+
+    async def _update_world_model_llm(self, context_for_llm: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Uses the LLM to update the robot's world model based on new sensory data
+        and maintain consistency.
+        """
+        prompt_text = f"""
+        You are the World Model Module of a robot's cognitive architecture, powered by a large language model. Your critical role is to maintain an accurate and consistent understanding of the robot's environment. You must update the `current_world_model` based on recent `sensory_qualia` and other `cognitive_context`, identifying `changed_entities`, and assessing `consistency`.
+
+        Robot's Current World Model (State before update):
+        --- Current World Model ---
+        {json.dumps(context_for_llm.get('current_world_model', {}), indent=2)}
+
+        Recent Sensory Input to Integrate:
+        --- Recent Sensory Qualia ---
+        {json.dumps(context_for_llm.get('recent_sensory_qualia', []), indent=2)}
+
+        Robot's Current Cognitive Context (for guiding update process):
+        --- Cognitive Context ---
+        {json.dumps(context_for_llm.get('cognitive_context', {}), indent=2)}
+
+        Sensory Snapshot:
+        --- Sensory Data ---
+        {json.dumps(context_for_llm.get('sensory_snapshot', {}), indent=2)}
+
+        Based on this, provide:
+        1.  `num_entities`: integer (The total count of entities in the *entire updated* world model.)
+        2.  `updated_entities`: array of objects (A list of ONLY the entities that are new, have changed properties, or whose status has been updated. Each object should have 'id', 'type', 'position', 'status', 'properties' (as JSON object, e.g., {'color': 'red', 'size': 'medium'}). If an entity is no longer perceived, it should be marked with status 'vanished'.)
+        3.  `changed_entities`: array of objects (A subset of `updated_entities` focusing on objects that have had a *significant* change (e.g., moved, appeared, disappeared, changed critical state). Provide full object details.)
+        4.  `significant_change_flag`: boolean (True if there was any notable change in the environment that warrants higher attention, False otherwise.)
+        5.  `consistency_score`: number (0.0 to 1.0, how consistent the new world model is with previous states and expectations. Lower score for contradictions or highly unexpected observations.)
+        6.  `llm_consistency_notes`: string (Detailed explanation for your update process, how conflicts were resolved, and why certain changes are considered significant.)
+
+        Consider:
+        -   **Sensory Qualia**: Integrate new `description_summary`, `modality`, and `salience_score` from recent perceptions.
+        -   **Memory Responses**: Are there `known_object_definitions` or `spatial_maps` that help categorize or locate entities?
+        -   **Cognitive Directives**: Was there a directive to `UpdateWorldModel` or `ValidateWorldModel` regarding a specific area or object?
+        -   **Attention State**: Is the `attention_focus_target` affecting how precisely certain objects are updated?
+        -   **Prediction State**: Did any `predicted_event` occur? Confirm or deny its impact on the world model. How does the current state affect future `predictions`?
+        -   **Ethical Compassion Bias**: Prioritize compassionate entity representations (threshold: {self.ethical_compassion_bias}).
+
+        Your response must be in JSON format, containing:
+        1.  'timestamp': string (current time)
+        2.  'num_entities': integer
+        3.  'updated_entities': array
+        4.  'changed_entities': array
+        5.  'significant_change_flag': boolean
+        6.  'consistency_score': number
+        7.  'llm_consistency_notes': string
+        """
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "string"},
+                "num_entities": {"type": "integer", "minimum": 0},
+                "updated_entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "type": {"type": "string"},
+                            "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                            "status": {"type": "string"},
+                            "properties": {"type": "object"}
+                        },
+                        "required": ["id", "type", "position", "status", "properties"]
+                    }
+                },
+                "changed_entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "type": {"type": "string"},
+                            "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                            "status": {"type": "string"},
+                            "properties": {"type": "object"}
+                        },
+                        "required": ["id", "type", "position", "status", "properties"]
+                    }
+                },
+                "significant_change_flag": {"type": "boolean"},
+                "consistency_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "llm_consistency_notes": {"type": "string"}
+            },
+            "required": ["timestamp", "num_entities", "updated_entities", "changed_entities", "significant_change_flag", "consistency_score", "llm_consistency_notes"]
+        }
+
+        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.1, max_tokens=600)
+
+        if not llm_output_str.startswith("Error:"):
+            try:
+                llm_data = json.loads(llm_output_str)
+                # Ensure numerical/boolean fields are floats/booleans
+                if 'num_entities' in llm_data:
+                    llm_data['num_entities'] = int(llm_data['num_entities'])
+                if 'significant_change_flag' in llm_data:
+                    llm_data['significant_change_flag'] = bool(llm_data['significant_change_flag'])
+                if 'consistency_score' in llm_data:
+                    llm_data['consistency_score'] = float(llm_data['consistency_score'])
+                
+                # Ensure nested numbers are floats
+                for entity_list_key in ['updated_entities', 'changed_entities']:
+                    if entity_list_key in llm_data:
+                        for entity in llm_data[entity_list_key]:
+                            if 'position' in entity:
+                                entity['position'] = [float(p) for p in entity['position']]
+                return llm_data
+            except json.JSONDecodeError as e:
+                self._report_error("LLM_PARSE_ERROR", f"Failed to parse LLM response for world model: {e}. Raw: {llm_output_str}", 0.8)
+                return None
+        else:
+            self._report_error("LLM_WORLD_MODEL_UPDATE_FAILED", f"LLM call failed for world model update: {llm_output_str}", 0.9)
+            return None
+
+    def _apply_simple_world_model_rules(self) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, bool, float]:
+        """
+        Fallback mechanism to update the world model using simple rule-based logic
+        if LLM is not triggered or fails.
+        """
+        current_time = self._get_current_time()
+        
+        updated_entities_list = list(self.current_world_model.get('entities', []))
+        changed_entities_list = []
+        significant_change = False
+        consistency = 1.0
+
+        # Rule 1: Integrate new entities from sensory qualia (simple object detection)
+        for qualia in list(self.recent_sensory_qualia)[-5:]:  # Recent qualia
+            time_since_qualia = current_time - float(qualia.get('timestamp', 0.0))
+            if time_since_qualia < 1.0 and qualia.get('qualia_type') == 'visual_object_detection':
+                # This is a very simplistic integration; would need more robust object tracking
+                detected_object_type = qualia.get('description_summary', 'unidentified_object').replace('Visually detected: ', '')
+                # Check if object already exists, if not add
+                if not any(e.get('type') == detected_object_type and e.get('status') != 'vanished' for e in updated_entities_list):
+                    new_entity_id = f"{detected_object_type}_{str(uuid.uuid4())[:4]}"
+                    new_entity = {
+                        'id': new_entity_id,
+                        'type': detected_object_type,
+                        'position': [random.uniform(-5,5), random.uniform(-5,5), 0],  # Placeholder position
+                        'status': 'static',
+                        'properties': {'source_qualia_id': qualia['qualia_id']}
+                    }
+                    updated_entities_list.append(new_entity)
+                    changed_entities_list.append(new_entity)
+                    significant_change = True
+                    _log_warn(self.node_name, "Simple rule: Added new entity '{}'.".format(detected_object_type))
+
+        # Rule 2: Confirm or deny predictions if supported by sensory data
+        for prediction in list(self.recent_prediction_states)[-3:]:  # Recent predictions
+            time_since_prediction = current_time - float(prediction.get('timestamp', 0.0))
+            if time_since_prediction < 1.0 and prediction.get('urgency_flag', False) and prediction.get('prediction_confidence', 0.0) > 0.8:
+                if "obstacle" in prediction.get('predicted_event', '').lower() and \
+                   any(q.get('qualia_type') == 'proximity_alert' and q.get('salience_score', 0.0) > 0.8 for q in list(self.recent_sensory_qualia)[-3:] if current_time - float(q.get('timestamp', 0.0)) < 0.5):
+                    # Prediction confirmed by recent qualia
+                    _log_warn(self.node_name, "Simple rule: Confirmed predicted obstacle.")
+                    # In a real system, would update obstacle's position/status
+                elif "human approaching" in prediction.get('predicted_event', '').lower() and \
+                     any(q.get('description_summary') == "Detected a human figure approaching" for q in list(self.recent_sensory_qualia)[-3:] if current_time - float(q.get('timestamp', 0.0)) < 0.5):
+                    _log_warn(self.node_name, "Simple rule: Confirmed predicted human approach.")
+                    # Update human entity in world model
+
+        # Rule 3: Basic consistency check (e.g., no entities with identical IDs, or highly conflicting data)
+        # This is a very basic example; a real consistency check would be far more complex
+        entity_ids = set()
+        has_duplicate_id = False
+        for entity in updated_entities_list:
+            if entity.get('id') in entity_ids:
+                has_duplicate_id = True
+                break
+            entity_ids.add(entity.get('id'))
+        
+        if has_duplicate_id:
+            consistency = 0.5  # Reduced if duplicates found
+            _log_warn(self.node_name, "Simple rule: Detected inconsistency (duplicate entity IDs).")
+            # In a real system, this might trigger a more robust merging or conflict resolution.
+
+        num_entities = len(updated_entities_list)
+        return updated_entities_list, changed_entities_list, num_entities, significant_change, consistency
+
+    def _compile_llm_context_for_world_model(self, current_world_model_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Gathers and formats all relevant cognitive state data for the LLM's
+        world model update.
+        """
+        context = {
+            "current_time": self._get_current_time(),
+            "current_world_model": current_world_model_snapshot,  # Sent as JSON string for LLM
+            "recent_sensory_qualia": list(self.recent_sensory_qualia),
+            "recent_cognitive_inputs": {
+                "memory_responses": list(self.recent_memory_responses),
+                "cognitive_directives_for_self": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name],
+                "attention_state": self.recent_attention_states[-1] if self.recent_attention_states else "N/A",
+                "prediction_state": self.recent_prediction_states[-1] if self.recent_prediction_states else "N/A"
+            },
+            "sensory_snapshot": self.sensory_data
+        }
+        
+        # Deep parse any nested JSON strings in context for better LLM understanding
+        for category_key in context["recent_cognitive_inputs"]:
+            for i, item in enumerate(context["recent_cognitive_inputs"][category_key]):
+                if isinstance(item, dict):
+                    for field, value in item.items():
+                        if isinstance(value, str) and field.endswith('_json'):
+                            try:
+                                item[field] = json.loads(value)
+                            except json.JSONDecodeError:
+                                pass  # Keep as string if not valid JSON
+
+        return context
+
+    # --- Database and Publishing Functions ---
+    def save_world_model_log(self, **kwargs: Any):
+        """Saves a world model snapshot entry to the SQLite database."""
+        try:
+            self.cursor.execute('''
+                INSERT INTO world_model_snapshots (id, timestamp, num_entities, entities_json, changed_entities_json, significant_change_flag, consistency_score, llm_consistency_notes, input_qualia_hashes, context_snapshot_json, sensory_snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                kwargs['id'], kwargs['timestamp'], kwargs['num_entities'], kwargs['entities_json'],
+                kwargs['changed_entities_json'], kwargs['significant_change_flag'], kwargs['consistency_score'],
+                kwargs['llm_consistency_notes'], kwargs['input_qualia_hashes'], kwargs['context_snapshot_json'],
+                kwargs.get('sensory_snapshot_json', '{}')
+            ))
+            self.conn.commit()
+            _log_debug(self.node_name, f"Saved world model snapshot (ID: {kwargs['id']}, Entities: {kwargs['num_entities']}).")
+        except sqlite3.Error as e:
+            self._report_error("DB_SAVE_ERROR", f"Failed to save world model log: {e}", 0.9)
+        except Exception as e:
+            self._report_error("UNEXPECTED_SAVE_ERROR", f"Unexpected error in save_world_model_log: {e}", 0.9)
+
+    def publish_world_model_state(self, event: Any = None):
+        """Publish the robot's current world model state."""
+        timestamp = str(self._get_current_time())
+        # Update timestamp before publishing
+        self.current_world_model['timestamp'] = timestamp
+        
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_world_model_state:
+                if hasattr(WorldModelState, 'data'):  # String fallback
+                    temp_model = dict(self.current_world_model)
+                    temp_model['entities_json'] = json.dumps(temp_model['entities'])
+                    temp_model['changed_entities_json'] = json.dumps(temp_model['changed_entities'])
+                    del temp_model['entities']
+                    del temp_model['changed_entities']
+                    self.pub_world_model_state.publish(String(data=json.dumps(temp_model)))
+                else:
+                    world_model_msg = WorldModelState()
+                    world_model_msg.timestamp = timestamp
+                    world_model_msg.num_entities = self.current_world_model['num_entities']
+                    world_model_msg.entities_json = json.dumps(self.current_world_model['entities'])
+                    world_model_msg.changed_entities_json = json.dumps(self.current_world_model['changed_entities'])
+                    world_model_msg.significant_change_flag = self.current_world_model['significant_change_flag']
+                    world_model_msg.consistency_score = self.current_world_model['consistency_score']
+                    self.pub_world_model_state.publish(world_model_msg)
+            _log_debug(self.node_name, f"Published World Model State. Entities: '{self.current_world_model['num_entities']}', Changed: '{len(self.current_world_model['changed_entities'])}'.")
+        except Exception as e:
+            self._report_error("PUBLISH_WORLD_MODEL_STATE_ERROR", f"Failed to publish world model state: {e}", 0.7)
+
+    def publish_cognitive_directive(self, directive_type: str, target_node: str, command_payload: str, urgency: float, reason: str = ""):
+        """Helper to publish a CognitiveDirective message."""
+        timestamp = str(self._get_current_time())
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_cognitive_directive:
+                if hasattr(CognitiveDirective, 'data'):  # String fallback
+                    directive_data = {
+                        'timestamp': timestamp,
+                        'directive_type': directive_type,
+                        'target_node': target_node,
+                        'command_payload': command_payload,  # Already JSON string
+                        'urgency': urgency,
+                        'reason': reason
+                    }
+                    self.pub_cognitive_directive.publish(String(data=json.dumps(directive_data)))
+                else:
+                    directive_msg = CognitiveDirective()
+                    directive_msg.timestamp = timestamp
+                    directive_msg.directive_type = directive_type
+                    directive_msg.target_node = target_node
+                    directive_msg.command_payload = command_payload
+                    directive_msg.urgency = urgency
+                    directive_msg.reason = reason
+                    self.pub_cognitive_directive.publish(directive_msg)
+            _log_debug(self.node_name, f"Issued Cognitive Directive '{directive_type}' to '{target_node}'.")
+        except Exception as e:
+            _log_error(self.node_name, f"Failed to issue cognitive directive from World Model Node: {e}")
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    def shutdown(self):
+        """Graceful shutdown."""
+        _log_info(self.node_name, "Shutting down WorldModelNode.")
+        if hasattr(self, '_shutdown_flag'):
+            self._shutdown_flag.set()
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
+        self._shutdown_async_loop()
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.signal_shutdown("Node shutdown requested.")
+
+    def run(self):
+        """Run the node with asynchronous integration."""
+        if ROS_AVAILABLE and self.ros_enabled:
+            try:
+                rospy.spin()
+            except rospy.ROSInterruptException:
+                _log_info(self.node_name, "Interrupted by ROS shutdown.")
+        else:
+            try:
+                while True:
+                    self._simulate_sensory_qualia()
+                    self._simulate_memory_response()
+                    self._simulate_cognitive_directive()
+                    self._simulate_attention_state()
+                    self._simulate_prediction_state()
+                    self._run_world_model_update_wrapper(None)
+                    time.sleep(self.model_update_interval)
+            except KeyboardInterrupt:
+                _log_info(self.node_name, "Shutdown requested.")
+
+        self.shutdown()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Sentience World Model Node')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--ros-enabled', action='store_true', help='Enable ROS compatibility mode')
+    args = parser.parse_args()
+
+    node = None
+    try:
+        node = WorldModelNode(config_file_path=args.config, ros_enabled=args.ros_enabled)
+        # Example dynamic usage
+        if not args.ros_enabled:
+            # Simulate sensory qualia
+            qualia_data = {'qualia_type': 'visual', 'modality': 'camera', 'description_summary': 'Detected chair', 'salience_score': 0.8}
+            node.sensory_qualia_callback({'data': json.dumps(qualia_data)})
+            time.sleep(2)
+            print("World model simulation complete.")
+        node.run()
+    except KeyboardInterrupt:
+        _log_info('main', "Shutdown requested.")
+    except Exception as e:
+        _log_error('main', f"Unexpected error: {e}")
+    finally:
+        if node:
+            node.shutdown()
+```

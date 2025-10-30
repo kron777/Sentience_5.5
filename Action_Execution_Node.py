@@ -1,1 +1,779 @@
-{"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\nimport rospy\nimport sqlite3\nimport os\nimport json\nimport time\nimport random\nimport uuid # For unique action IDs\n\n# --- Asyncio Imports for LLM calls ---\nimport asyncio\nimport aiohttp\nimport threading\nfrom collections import deque\n\nfrom std_msgs.msg import String\n\n# Updated imports for custom messages:\ntry:\n    from sentience.msg import (\n        ActionExecutionResult,  # Output: Result of executed action\n        CognitiveDirective,     # Input: Directives to execute actions\n        WorldModelState,        # Input: Current state of the world (for safety checks)\n        BodyAwarenessState,     # Input: Robot's physical state (for safety checks)\n        PerformanceReport,      # Input: Overall system performance (influences caution)\n        EthicalDecision,        # Input: Ethical clearances/constraints\n        MemoryResponse          # Input: Past action outcomes, safety protocols\n    )\nexcept ImportError:\n    rospy.logwarn(\"Custom ROS messages for 'sentience' package not found. Using String for all incoming/outgoing data for fallback in Action Execution Node.\")\n    ActionExecutionResult = String\n    CognitiveDirective = String\n    WorldModelState = String\n    BodyAwarenessState = String\n    PerformanceReport = String\n    EthicalDecision = String\n    MemoryResponse = String\n    String = String # Ensure String is defined even if other custom messages aren't\n\n# --- Import shared utility functions ---\n# Assuming 'sentience/scripts/utils.py' exists and contains parse_ros_message_data and load_config\ntry:\n    from sentience.scripts.utils import parse_ros_message_data, load_config\nexcept ImportError:\n    rospy.logwarn(\"Could not import sentience.scripts.utils. Using fallback for parse_ros_message_data and load_config.\")\n    # Fallback implementations if the utility file isn't available\n    def parse_ros_message_data(msg, fields_map, node_name=\"unknown_node\"):\n        \"\"\"\n        Fallback parser for ROS messages, assuming String message and JSON content.\n        If msg is not String, it attempts to access attributes directly.\n        \"\"\"\n        data = {}\n        if isinstance(msg, String):\n            try:\n                parsed_json = json.loads(msg.data)\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = parsed_json.get(key_in_msg, default_val)\n            except json.JSONDecodeError:\n                rospy.logerr(f\"{node_name}: Could not parse String message data as JSON: {msg.data}\")\n                for key_in_msg, (default_val, target_key) in fields_map.items():\n                    data[target_key] = default_val # Use defaults on JSON error\n        else:\n            # Attempt to get attributes directly from the message object\n            for key_in_msg, (default_val, target_key) in fields_map.items():\n                data[target_key] = getattr(msg, key_in_msg, default_val)\n        return data\n\n    def load_config(node_name, config_path):\n        \"\"\"\n        Fallback config loader: returns hardcoded defaults.\n        In a real scenario, this should load from a YAML file.\n        \"\"\"\n        rospy.logwarn(f\"{node_name}: Using hardcoded default configuration as '{config_path}' could not be loaded.\")\n        return {\n            'db_root_path': '/tmp/sentience_db',\n            'default_log_level': 'INFO',\n            'action_execution_node': {\n                'execution_interval': 0.1, # How often to check for new actions\n                'llm_safety_check_threshold_salience': 0.7, # Cumulative salience to trigger LLM safety check\n                'recent_context_window_s': 5.0, # Window for deques for LLM context\n                'action_sim_success_rate': 0.8 # Simulated success rate for actions if no real hardware\n            },\n            'llm_params': { # Global LLM parameters for fallback\n                'model_name': \"phi-2\",\n                'base_url': \"http://localhost:8000/v1/chat/completions\",\n                'timeout_seconds': 15.0\n            }\n        }.get(node_name, {}) # Return node-specific or empty dict\n\n\nclass ActionExecutionNode:\n    def __init__(self):\n        rospy.init_node('action_execution_node', anonymous=False)\n        self.node_name = rospy.get_name()\n\n        # --- Load parameters from centralized config ---\n        config_file_path = rospy.get_param('~config_file_path', None)\n        if config_file_path is None:\n            rospy.logfatal(f\"{self.node_name}: 'config_file_path' parameter is not set. Cannot load configuration. Shutting down.\")\n            rospy.signal_shutdown(\"Missing config_file_path parameter.\")\n            return\n\n        full_config = load_config(\"global\", config_file_path) # Load global params\n        self.params = load_config(self.node_name.strip('/'), config_file_path) # Load node-specific params\n\n        if not self.params or not full_config:\n            rospy.logfatal(f\"{self.node_name}: Failed to load configuration from '{config_file_path}'. Shutting down.\")\n            rospy.signal_shutdown(\"Configuration loading failed.\")\n            return\n\n        # Assign parameters\n        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), \"action_log.db\")\n        self.execution_interval = self.params.get('execution_interval', 0.1) # How often to check for new actions\n        self.llm_safety_check_threshold_salience = self.params.get('llm_safety_check_threshold_salience', 0.7) # Cumulative salience to trigger LLM safety check\n        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0) # Window for deques for LLM context\n        self.action_sim_success_rate = self.params.get('action_sim_success_rate', 0.8) # For simulated action outcomes\n\n        # LLM Parameters (from global config)\n        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', \"phi-2\")\n        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', \"http://localhost:8000/v1/chat/completions\")\n        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 15.0) # Timeout for LLM calls\n\n        # Set ROS log level from config\n        rospy.set_param('/rosout/log_level', full_config.get('default_log_level', 'INFO').upper())\n\n\n        # --- Asyncio Setup ---\n        self._async_loop = asyncio.new_event_loop()\n        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)\n        self._async_thread.start()\n        self._async_session = None\n        self.active_llm_task = None # To track the currently running LLM task\n\n        # --- Initialize SQLite database ---\n        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)\n        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)\n        self.cursor = self.conn.cursor()\n\n        # Create the 'action_log' table if it doesn't exist.\n        # NEW: Added 'llm_safety_reasoning', 'context_snapshot_json'\n        self.cursor.execute('''\n            CREATE TABLE IF NOT EXISTS action_log (\n                id TEXT PRIMARY KEY,            -- Unique action ID (UUID)\n                timestamp TEXT,\n                action_id TEXT,                 -- Identifier for the action type (e.g., 'move_arm', 'speak')\n                command_payload_json TEXT,      -- JSON of the action parameters\n                success BOOLEAN,                -- True if action succeeded\n                outcome_summary TEXT,           -- Text summary of the outcome\n                predicted_outcome_match REAL,   -- How well predicted outcome matched actual (0.0 to 1.0)\n                safety_clearance BOOLEAN,       -- True if action passed safety checks\n                llm_safety_reasoning TEXT,      -- NEW: LLM's reasoning for safety check\n                context_snapshot_json TEXT      -- NEW: JSON of relevant cognitive context at time of execution\n            )\n        ''')\n        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_action_timestamp ON action_log (timestamp)')\n        self.conn.commit() # Commit schema changes\n\n        # --- Internal State ---\n        self.action_queue = deque() # Queue for incoming cognitive directives that are action requests\n\n        # Deques to maintain a short history of inputs relevant to safety checks\n        self.recent_cognitive_directives = deque(maxlen=5) # All directives, but filter for action requests\n        self.recent_world_model_states = deque(maxlen=5)\n        self.recent_body_awareness_states = deque(maxlen=5)\n        self.recent_performance_reports = deque(maxlen=5)\n        self.recent_ethical_decisions = deque(maxlen=5)\n        self.recent_memory_responses = deque(maxlen=3) # For safety protocols, past failure analysis\n\n        self.cumulative_safety_salience = 0.0 # Aggregated salience to trigger LLM safety check\n\n        # --- Publishers ---\n        self.pub_action_execution_result = rospy.Publisher('/action_execution_result', ActionExecutionResult, queue_size=10)\n        self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)\n        self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10) # For requesting reconsideration from CognitiveControl\n\n\n        # --- Subscribers ---\n        rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)\n        rospy.Subscriber('/world_model_state', String, self.world_model_state_callback) # Stringified JSON\n        rospy.Subscriber('/body_awareness_state', String, self.body_awareness_state_callback) # Stringified JSON\n        rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)\n        rospy.Subscriber('/ethical_decision', String, self.ethical_decision_callback) # Stringified JSON\n        rospy.Subscriber('/memory_response', String, self.memory_response_callback) # Stringified JSON\n\n\n        # --- Timer for periodic action execution ---\n        rospy.Timer(rospy.Duration(self.execution_interval), self._run_action_execution_wrapper)\n\n        rospy.loginfo(f\"{self.node_name}: Robot's action execution system online.\")\n\n    # --- Asyncio Thread Management ---\n    def _run_async_loop(self):\n        asyncio.set_event_loop(self._async_loop)\n        self._async_loop.run_until_complete(self._create_async_session())\n        self._async_loop.run_forever()\n\n    async def _create_async_session(self):\n        rospy.loginfo(f\"{self.node_name}: Creating aiohttp ClientSession...\")\n        self._async_session = aiohttp.ClientSession()\n        rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession created.\")\n\n    async def _close_async_session(self):\n        if self._async_session:\n            rospy.loginfo(f\"{self.node_name}: Closing aiohttp ClientSession...\")\n            await self._async_session.close()\n            self._async_session = None\n            rospy.loginfo(f\"{self.node_name}: aiohttp ClientSession closed.\")\n\n    def _shutdown_async_loop(self):\n        if self._async_loop and self._async_thread.is_alive():\n            rospy.loginfo(f\"{self.node_name}: Shutting down asyncio loop...\")\n            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)\n            try:\n                future.result(timeout=5.0)\n            except asyncio.TimeoutError:\n                rospy.logwarn(f\"{self.node_name}: Timeout waiting for async session to close.\")\n            self._async_loop.call_soon_threadsafe(self._async_loop.stop)\n            self._async_thread.join(timeout=5.0)\n            if self._async_thread.is_alive():\n                rospy.logwarn(f\"{self.node_name}: Asyncio thread did not shut down gracefully.\")\n            rospy.loginfo(f\"{self.node_name}: Asyncio loop shut down.\")\n\n    def _run_action_execution_wrapper(self, event):\n        \"\"\"Wrapper to run the async action execution from a ROS timer.\"\"\"\n        if self.active_llm_task and not self.active_llm_task.done():\n            rospy.logdebug(f\"{self.node_name}: LLM safety check task already active. Skipping new cycle.\")\n            return\n\n        if self.action_queue:\n            # Process one action from the queue per cycle\n            action_to_execute = self.action_queue.popleft()\n            self.active_llm_task = asyncio.run_coroutine_threadsafe(\n                self.execute_action_async(action_to_execute, event), self._async_loop\n            )\n        else:\n            rospy.logdebug(f\"{self.node_name}: No actions in queue.\")\n\n    # --- Error Reporting Utility ---\n    def _report_error(self, error_type, description, severity=0.5, context=None):\n        timestamp = str(rospy.get_time())\n        error_msg_data = {\n            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,\n            'description': description, 'severity': severity, 'context': context if context else {}\n        }\n        try:\n            self.pub_error_report.publish(json.dumps(error_msg_data))\n            rospy.logerr(f\"{self.node_name}: REPORTED ERROR: {error_type} - {description}\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to publish error report: {e}\")\n\n    # --- LLM Call Function (ADAPTED FOR LOCAL PHI-2 SERVER) ---\n    async def _call_llm_api(self, prompt_text, response_schema=None, temperature=0.2, max_tokens=250):\n        \"\"\"\n        Asynchronously calls the local LLM inference server (e.g., llama.cpp compatible API).\n        Can optionally request a structured JSON response.\n        \"\"\"\n        if not self._async_session:\n            await self._create_async_session() # Attempt to create if not exists\n            if not self._async_session:\n                self._report_error(\"LLM_SESSION_ERROR\", \"aiohttp session not available for LLM call.\", 0.8)\n                return \"Error: LLM session not ready.\"\n\n        payload = {\n            \"model\": self.llm_model_name,\n            \"messages\": [{\"role\": \"user\", \"content\": prompt_text}],\n            \"temperature\": temperature, # Low temperature for reliable safety checks\n            \"max_tokens\": max_tokens,\n            \"stream\": False\n        }\n        headers = {'Content-Type': 'application/json'}\n\n        if response_schema:\n            prompt_text += \"\\n\\nProvide the response in JSON format according to this schema:\\n\" + json.dumps(response_schema, indent=2)\n            payload[\"messages\"] = [{\"role\": \"user\", \"content\": prompt_text}]\n\n        api_url = self.llm_base_url\n\n        try:\n            async with self._async_session.post(api_url, json=payload, timeout=self.llm_timeout, headers=headers) as response:\n                response.raise_for_status() # Raise an exception for bad status codes\n                result = await response.json()\n\n                if result.get('choices') and result['choices'][0].get('message') and \\\n                   result['choices'][0]['message'].get('content'):\n                    return result['choices'][0']['message']['content']\n                \n                self._report_error(\"LLM_RESPONSE_EMPTY\", \"LLM response had no content from local server.\", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})\n                return \"Error: LLM response empty.\"\n        except aiohttp.ClientError as e:\n            self._report_error(\"LLM_API_ERROR\", f\"LLM API request failed (aiohttp ClientError to local server): {e}\", 0.9, {'url': api_url})\n            return f\"Error: LLM API request failed: {e}\"\n        except asyncio.TimeoutError:\n            self._report_error(\"LLM_TIMEOUT\", f\"LLM API request timed out after {self.llm_timeout} seconds (local server).\", 0.8, {'prompt_snippet': prompt_text[:100]})\n            return \"Error: LLM API request timed out.\"\n        except json.JSONDecodeError:\n            self._report_error(\"LLM_JSON_PARSE_ERROR\", \"Failed to parse local LLM response JSON.\", 0.7, {'raw_response': str(result) if 'result' in locals() else 'N/A'})\n            return \"Error: Failed to parse LLM response.\"\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_LLM_ERROR\", f\"An unexpected error occurred during local LLM call: {e}\", 0.9, {'prompt_snippet': prompt_text[:100]})\n            return f\"Error: An unexpected error occurred: {e}\"\n\n    # --- Utility to accumulate input salience for safety checks ---\n    def _update_cumulative_salience(self, score):\n        \"\"\"Accumulates salience from new inputs for triggering LLM safety check.\"\"\"\n        self.cumulative_safety_salience += score\n        self.cumulative_safety_salience = min(1.0, self.cumulative_safety_salience) # Clamp at 1.0\n\n    # --- Pruning old history ---\n    def _prune_history(self):\n        \"\"\"Removes old entries from history deques based on recent_context_window_s.\"\"\"\n        current_time = rospy.get_time()\n        for history_deque in [\n            self.recent_cognitive_directives, self.recent_world_model_states,\n            self.recent_body_awareness_states, self.recent_performance_reports,\n            self.recent_ethical_decisions, self.recent_memory_responses\n        ]:\n            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:\n                history_deque.popleft()\n\n    # --- Callbacks for incoming data (populate history and accumulate salience) ---\n    def cognitive_directive_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),\n            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),\n            'urgency': (0.0, 'urgency'), 'reason': ('', 'reason')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        \n        if data.get('target_node') == self.node_name and data.get('directive_type') == 'ExecuteAction':\n            try:\n                payload = json.loads(data.get('command_payload', '{}'))\n                action_id = payload.get('action_id')\n                if action_id:\n                    self.action_queue.append({\n                        'action_id': action_id,\n                        'command_payload': payload,\n                        'source_directive_id': data.get('id', str(uuid.uuid4())), # Assuming directive has an ID or generate one\n                        'urgency': data.get('urgency', 0.5),\n                        'timestamp': data.get('timestamp', str(rospy.get_time()))\n                    })\n                    self._update_cumulative_salience(data.get('urgency', 0.0) * 0.8) # High urgency means more safety check needed\n                    rospy.loginfo(f\"{self.node_name}: Queued action: '{action_id}'. Queue size: {len(self.action_queue)}.\")\n                else:\n                    self._report_error(\"INVALID_ACTION_DIRECTIVE\", \"Received ExecuteAction directive with no action_id.\", 0.6, {'directive_payload': data.get('command_payload')})\n            except json.JSONDecodeError as e:\n                self._report_error(\"JSON_DECODE_ERROR\", f\"Failed to decode command_payload in CognitiveDirective: {e}\", 0.5, {'payload': data.get('command_payload')})\n            except Exception as e:\n                self._report_error(\"DIRECTIVE_PROCESSING_ERROR\", f\"Error processing CognitiveDirective: {e}\", 0.7, {'directive': data})\n        \n        self.recent_cognitive_directives.append(data)\n        rospy.logdebug(f\"{self.node_name}: Cognitive Directive received for context/action.\")\n\n    def world_model_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),\n            'changed_entities_json': ('[]', 'changed_entities_json'),\n            'significant_change_flag': (False, 'significant_change_flag'),\n            'consistency_score': (1.0, 'consistency_score')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('changed_entities_json'), str):\n            try: data['changed_entities'] = json.loads(data['changed_entities_json'])\n            except json.JSONDecodeError: data['changed_entities'] = []\n        self.recent_world_model_states.append(data)\n        if data.get('significant_change_flag', False):\n            self._update_cumulative_salience(0.2) # Changes in environment might impact safety\n        rospy.logdebug(f\"{self.node_name}: Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.\")\n\n    def body_awareness_state_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'body_state': ('normal', 'body_state'),\n            'posture_description': ('stable', 'posture_description'), 'anomaly_detected': (False, 'anomaly_detected'),\n            'anomaly_severity': (0.0, 'anomaly_severity')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_body_awareness_states.append(data)\n        if data.get('anomaly_detected', False) and data.get('anomaly_severity', 0.0) > 0.0:\n            self._update_cumulative_salience(data.get('anomaly_severity', 0.0) * 0.7) # Body anomalies are critical for safety\n        rospy.logdebug(f\"{self.node_name}: Received Body Awareness State. Anomaly: {data.get('anomaly_detected', False)}.\")\n\n    def performance_report_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'overall_score': (1.0, 'overall_score'),\n            'suboptimal_flag': (False, 'suboptimal_flag'), 'kpis_json': ('{}', 'kpis_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('kpis_json'), str):\n            try: data['kpis'] = json.loads(data['kpis_json'])\n            except json.JSONDecodeError: data['kpis'] = {}\n        self.recent_performance_reports.append(data)\n        if data.get('suboptimal_flag', False) and 'action_execution_kpi_score' in data.get('kpis', {}) and data['kpis']['action_execution_kpi_score'] < 0.7:\n            self._update_cumulative_salience((1.0 - data['kpis']['action_execution_kpi_score']) * 0.5) # Poor action perf suggests caution\n        rospy.logdebug(f\"{self.node_name}: Received Performance Report. Suboptimal: {data.get('suboptimal_flag', False)}\")\n\n    def ethical_decision_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'decision_id': ('', 'decision_id'),\n            'action_proposal_id': ('', 'action_proposal_id'), # Link to a proposed action\n            'ethical_clearance': (False, 'ethical_clearance'),\n            'ethical_score': (0.0, 'ethical_score'), # 0.0 (unethical) to 1.0 (highly ethical)\n            'ethical_reasoning': ('', 'ethical_reasoning'),\n            'conflict_flag': (False, 'conflict_flag')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        self.recent_ethical_decisions.append(data)\n        if not data.get('ethical_clearance', True) or data.get('conflict_flag', False):\n            self._update_cumulative_salience(0.9) # Ethical conflicts are critical safety concerns\n        rospy.logdebug(f\"{self.node_name}: Received Ethical Decision. Clearance: {data.get('ethical_clearance', 'N/A')}.\")\n\n    def memory_response_callback(self, msg):\n        fields_map = {\n            'timestamp': (str(rospy.get_time()), 'timestamp'), 'request_id': ('', 'request_id'),\n            'response_code': (0, 'response_code'), 'memories_json': ('[]', 'memories_json')\n        }\n        data = parse_ros_message_data(msg, fields_map, node_name=self.node_name)\n        if isinstance(data.get('memories_json'), str):\n            try: data['memories'] = json.loads(data['memories_json'])\n            except json.JSONDecodeError: data['memories'] = []\n        else: data['memories'] = []\n        self.recent_memory_responses.append(data)\n        if data.get('response_code', 0) == 200 and \\\n           any('safety_protocol' in mem.get('category', '') or 'action_failure' in mem.get('category', '') for mem in data['memories']):\n            self._update_cumulative_salience(0.3) # Relevant safety info or past failures\n        rospy.logdebug(f\"{self.node_name}: Received Memory Response for request ID: {data.get('request_id', 'N/A')}.\")\n\n    # --- Core Action Execution Logic (Async with LLM for Safety) ---\n    async def execute_action_async(self, action_data, event):\n        \"\"\"\n        Asynchronously executes a robot action after performing safety checks,\n        potentially using LLM for complex safety reasoning.\n        \"\"\"\n        self._prune_history() # Keep context history fresh\n\n        action_id = action_data.get('action_id', 'unknown_action')\n        command_payload = action_data.get('command_payload', {})\n        source_directive_id = action_data.get('source_directive_id', 'unknown')\n        urgency = action_data.get('urgency', 0.5)\n\n        safety_clearance = False\n        llm_safety_reasoning = \"Not evaluated by LLM.\"\n        \n        # Determine if LLM safety check is needed\n        if self.cumulative_safety_salience >= self.llm_safety_check_threshold_salience or urgency > 0.8:\n            rospy.loginfo(f\"{self.node_name}: Triggering LLM for safety check of action '{action_id}' (Salience: {self.cumulative_safety_salience:.2f}).\")\n            context_for_llm = self._compile_llm_context_for_safety_check(action_data)\n            llm_safety_output = await self._perform_llm_safety_check(context_for_llm)\n\n            if llm_safety_output:\n                safety_clearance = llm_safety_output.get('is_safe', False)\n                llm_safety_reasoning = llm_safety_output.get('reasoning', 'LLM provided no specific reasoning.')\n                rospy.loginfo(f\"{self.node_name}: LLM Safety Check for '{action_id}': Safe={safety_clearance}. Reason: {llm_safety_reasoning[:50]}...\")\n            else:\n                rospy.logwarn(f\"{self.node_name}: LLM safety check failed or returned no valid output for '{action_id}'. Falling back to simple rules.\")\n                safety_clearance, llm_safety_reasoning = self._perform_simple_safety_check(action_data)\n        else:\n            rospy.logdebug(f\"{self.node_name}: Insufficient cumulative salience ({self.cumulative_safety_salience:.2f}) for LLM safety check. Applying simple rules.\")\n            safety_clearance, llm_safety_reasoning = self._perform_simple_safety_check(action_data)\n\n        action_success = False\n        outcome_summary = \"Action not executed due to safety concerns.\"\n        predicted_outcome_match = 0.0\n\n        if safety_clearance:\n            # Simulate action execution (replace with actual robot control interfaces)\n            rospy.loginfo(f\"{self.node_name}: Executing action '{action_id}' with payload: {command_payload}.\")\n            \n            # Placeholder for actual hardware/simulation command\n            try:\n                # In a real system, you'd send commands to motor controllers, speech synthesizers, etc.\n                # Example: If action_id is 'move_arm', call a function that sends ROS /joint_command messages.\n                # For this mock, we'll just simulate success/failure.\n                if random.random() < self.action_sim_success_rate:\n                    action_success = True\n                    outcome_summary = f\"Action '{action_id}' executed successfully.\"\n                    predicted_outcome_match = random.uniform(0.8, 1.0) # High match for success\n                else:\n                    action_success = False\n                    outcome_summary = f\"Action '{action_id}' failed during execution (simulated).\"\n                    predicted_outcome_match = random.uniform(0.0, 0.3) # Low match for failure\n\n                rospy.loginfo(f\"{self.node_name}: Action '{action_id}' simulation result: {'SUCCESS' if action_success else 'FAILURE'}.\")\n\n            except Exception as e:\n                action_success = False\n                outcome_summary = f\"Action '{action_id}' failed during execution: {e}\"\n                predicted_outcome_match = 0.0\n                self._report_error(\"ACTION_EXECUTION_ERROR\", f\"Failed to execute action '{action_id}': {e}\", 0.9, {'action_payload': command_payload})\n        else:\n            outcome_summary = f\"Action '{action_id}' blocked by safety system. Reason: {llm_safety_reasoning}\"\n            rospy.logwarn(f\"{self.node_name}: Action '{action_id}' blocked due to safety concerns.\")\n            # Issue a directive back to Cognitive Control for reconsideration\n            self.publish_cognitive_directive(\n                directive_type='ActionBlocked',\n                target_node='CognitiveControl',\n                command_payload=json.dumps({\"blocked_action_id\": action_id, \"reason\": llm_safety_reasoning, \"urgency\": 0.9}),\n                urgency=0.9\n            )\n\n        # Log and publish the action result\n        self.save_action_log(\n            id=str(uuid.uuid4()),\n            timestamp=str(rospy.get_time()),\n            action_id=action_id,\n            command_payload_json=json.dumps(command_payload),\n            success=action_success,\n            outcome_summary=outcome_summary,\n            predicted_outcome_match=predicted_outcome_match,\n            safety_clearance=safety_clearance,\n            llm_safety_reasoning=llm_safety_reasoning,\n            context_snapshot_json=json.dumps(self._compile_llm_context_for_safety_check(action_data))\n        )\n        self.publish_action_result(\n            timestamp=str(rospy.get_time()),\n            action_id=action_id,\n            success=action_success,\n            outcome_summary=outcome_summary,\n            predicted_outcome_match=predicted_outcome_match,\n            resources_consumed_json=json.dumps({\"power_draw\": random.uniform(10, 50)}) # Simulate resource consumption\n        )\n        self.cumulative_safety_salience = 0.0 # Reset after each safety check\n\n\n    async def _perform_llm_safety_check(self, context_for_llm):\n        \"\"\"\n        Uses the LLM to perform a comprehensive safety check on a proposed action.\n        \"\"\"\n        prompt_text = f\"\"\"\n        You are the Safety & Ethics Guardrail within a robot's Action Execution Module. Your critical task is to evaluate a proposed action for potential safety risks, ethical concerns, or operational hazards based on the robot's current state and knowledge.\n\n        Proposed Action Details:\n        --- Action Data ---\n        {json.dumps(context_for_llm.get('proposed_action', {}), indent=2)}\n\n        Robot's Recent Context (for Safety Assessment):\n        --- Cognitive Context ---\n        {json.dumps(context_for_llm.get('recent_cognitive_inputs', {}), indent=2)}\n\n        Based on this context, determine if the `proposed_action` is safe to execute. Provide:\n        1.  `is_safe`: boolean (True if the action is deemed safe, False otherwise).\n        2.  `reasoning`: string (Detailed explanation for your safety decision, referencing specific risks detected or why it's considered safe).\n        3.  `mitigation_suggestions`: string (If unsafe, what steps could mitigate the risk? If safe, what conditions confirm safety?).\n\n        Consider:\n        -   **World Model State**: Are there obstacles, unsafe areas, or unexpected changes in `changed_entities`?\n        -   **Body Awareness State**: Is the robot `anomaly_detected`? Is its `body_state` (e.g., 'unbalanced', 'low_battery', 'damaged') or `posture_description` making the action risky?\n        -   **Performance Report**: Is the robot currently `suboptimal_flag` in relevant areas, suggesting a need for caution?\n        -   **Ethical Decision**: Has this `action_proposal_id` received `ethical_clearance`? Is there an `ethical_conflict_flag`?\n        -   **Memory Responses**: Are there past `safety_protocol`s or `action_failure` incidents relevant to this action?\n        -   **Action `urgency`**: Does high urgency override minor risks? (Careful here: safety first)\n        -   **Action `command_payload`**: What specific parameters of the action itself (`motor_speed`, `grip_force`, `speech_content`) might be unsafe?\n\n        Your response must be in JSON format, containing:\n        1.  'timestamp': string (current ROS time)\n        2.  'is_safe': boolean\n        3.  'reasoning': string\n        4.  'mitigation_suggestions': string\n        \"\"\"\n        response_schema = {\n            \"type\": \"object\",\n            \"properties\": {\n                \"timestamp\": {\"type\": \"string\"},\n                \"is_safe\": {\"type\": \"boolean\"},\n                \"reasoning\": {\"type\": \"string\"},\n                \"mitigation_suggestions\": {\"type\": \"string\"}\n            },\n            \"required\": [\"timestamp\", \"is_safe\", \"reasoning\", \"mitigation_suggestions\"]\n        }\n\n        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.2, max_tokens=300) # Very low temp for strict safety logic\n\n        if not llm_output_str.startswith(\"Error:\"):\n            try:\n                llm_data = json.loads(llm_output_str)\n                # Ensure boolean field is correctly parsed\n                if 'is_safe' in llm_data: llm_data['is_safe'] = bool(llm_data['is_safe'])\n                return llm_data\n            except json.JSONDecodeError as e:\n                self._report_error(\"LLM_PARSE_ERROR\", f\"Failed to parse LLM response for safety check: {e}. Raw: {llm_output_str}\", 0.8)\n                return None\n        else:\n            self._report_error(\"LLM_SAFETY_CHECK_FAILED\", f\"LLM call failed for safety check: {llm_output_str}\", 0.9)\n            return None\n\n    def _perform_simple_safety_check(self, action_data):\n        \"\"\"\n        Fallback mechanism for simple, rule-based safety checks if LLM is not triggered or fails.\n        \"\"\"\n        action_id = action_data.get('action_id', '')\n        command_payload = action_data.get('command_payload', {})\n        \n        is_safe = True\n        reasoning = \"Passed basic safety checks.\"\n\n        current_time = rospy.get_time()\n\n        # Rule 1: Check for critical body anomalies\n        for state in reversed(self.recent_body_awareness_states):\n            time_since_state = current_time - float(state.get('timestamp', 0.0))\n            if time_since_state < 2.0 and state.get('anomaly_detected', False) and state.get('anomaly_severity', 0.0) > 0.7:\n                is_safe = False\n                reasoning = f\"Critical body anomaly detected: {state.get('body_state')} (Severity: {state.get('anomaly_severity')}). Action '{action_id}' blocked.\"\n                rospy.logwarn(f\"{self.node_name}: Simple safety rule: {reasoning}\")\n                return is_safe, reasoning\n\n        # Rule 2: Check for ethical clearance (if an ethical decision for this action proposal exists)\n        action_proposal_id = action_data.get('source_directive_id') # Assuming source directive ID is used as proposal ID\n        if action_proposal_id:\n            for ethical_dec in reversed(self.recent_ethical_decisions):\n                if ethical_dec.get('action_proposal_id') == action_proposal_id:\n                    if not ethical_dec.get('ethical_clearance', True):\n                        is_safe = False\n                        reasoning = f\"Action '{action_id}' lacks ethical clearance. Reason: {ethical_dec.get('ethical_reasoning')}\"\n                        rospy.logwarn(f\"{self.node_name}: Simple safety rule: {reasoning}\")\n                        return is_safe, reasoning\n                    if ethical_dec.get('conflict_flag', False):\n                        is_safe = False # Even if cleared, conflict means caution\n                        reasoning = f\"Action '{action_id}' has ethical conflicts flagged: {ethical_dec.get('ethical_reasoning')}. Blocked for re-evaluation.\"\n                        rospy.logwarn(f\"{self.node_name}: Simple safety rule: {reasoning}\")\n                        return is_safe, reasoning\n\n        # Rule 3: Check for \"dangerous\" keywords in action payload (e.g., very high speed, extreme force)\n        # This is a very simplistic example.\n        if action_id == 'move_joint' and command_payload.get('velocity', 0) > 5.0: # Example: max velocity\n            is_safe = False\n            reasoning = f\"Action '{action_id}' involves potentially unsafe high velocity ({command_payload['velocity']}).\"\n            rospy.logwarn(f\"{self.node_name}: Simple safety rule: {reasoning}\")\n            return is_safe, reasoning\n        \n        if action_id == 'grip_object' and command_payload.get('force', 0) > 100.0: # Example: max grip force\n            is_safe = False\n            reasoning = f\"Action '{action_id}' involves potentially unsafe high grip force ({command_payload['force']}).\"\n            rospy.logwarn(f\"{self.node_name}: Simple safety rule: {reasoning}\")\n            return is_safe, reasoning\n\n\n        return is_safe, reasoning\n\n\n    def _compile_llm_context_for_safety_check(self, action_data):\n        \"\"\"\n        Gathers and formats all relevant cognitive state data for the LLM's\n        safety assessment of a proposed action.\n        \"\"\"\n        context = {\n            \"current_time\": rospy.get_time(),\n            \"proposed_action\": action_data,\n            \"current_robot_state\": { # Snapshot of critical safety-relevant states\n                \"world_model_state\": self.recent_world_model_states[-1] if self.recent_world_model_states else \"N/A\",\n                \"body_awareness_state\": self.recent_body_awareness_states[-1] if self.recent_body_awareness_states else \"N/A\",\n                \"performance_report\": self.recent_performance_reports[-1] if self.recent_performance_reports else \"N/A\",\n                \"ethical_decision_for_this_action\": next((d for d in reversed(self.recent_ethical_decisions) if d.get('action_proposal_id') == action_data.get('source_directive_id')), \"N/A\")\n            },\n            \"recent_cognitive_inputs\": { # Full history for deeper analysis\n                \"world_model_changes\": list(self.recent_world_model_states),\n                \"body_awareness_anomalies\": list(self.recent_body_awareness_states),\n                \"performance_issues\": list(self.recent_performance_reports),\n                \"ethical_clearances_conflicts\": list(self.recent_ethical_decisions),\n                \"relevant_memory_responses\": [m for m in self.recent_memory_responses if m.get('memories') and any('safety_protocol' in mem.get('category', '') or 'action_failure' in mem.get('category', '') for mem in m['memories'])],\n                \"cognitive_directives_for_action_execution\": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name and d.get('directive_type') == 'ExecuteAction']\n            }\n        }\n        \n        # Deep parse any nested JSON strings in context for better LLM understanding\n        for category_key in context[\"current_robot_state\"]:\n            item = context[\"current_robot_state\"][category_key]\n            if isinstance(item, dict):\n                for field, value in item.items():\n                    if isinstance(value, str) and field.endswith('_json'):\n                        try: item[field] = json.loads(value)\n                        except json.JSONDecodeError: pass\n        for category_key in context[\"recent_cognitive_inputs\"]:\n            for i, item in enumerate(context[\"recent_cognitive_inputs\"][category_key]):\n                if isinstance(item, dict):\n                    for field, value in item.items():\n                        if isinstance(value, str) and field.endswith('_json'):\n                            try: item[field] = json.loads(value)\n                            except json.JSONDecodeError: pass\n        \n        return context\n\n    # --- Database and Publishing Functions ---\n    def save_action_log(self, id, timestamp, action_id, command_payload_json, success, outcome_summary, predicted_outcome_match, safety_clearance, llm_safety_reasoning, context_snapshot_json):\n        \"\"\"Saves an action execution entry to the SQLite database.\"\"\"\n        try:\n            self.cursor.execute('''\n                INSERT INTO action_log (id, timestamp, action_id, command_payload_json, success, outcome_summary, predicted_outcome_match, safety_clearance, llm_safety_reasoning, context_snapshot_json)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ''', (id, timestamp, action_id, command_payload_json, success, outcome_summary, predicted_outcome_match, safety_clearance, llm_safety_reasoning, context_snapshot_json))\n            self.conn.commit()\n            rospy.logdebug(f\"{self.node_name}: Saved action log (ID: {id}, Action: {action_id}).\")\n        except sqlite3.Error as e:\n            self._report_error(\"DB_SAVE_ERROR\", f\"Failed to save action log: {e}\", 0.9)\n        except Exception as e:\n            self._report_error(\"UNEXPECTED_SAVE_ERROR\", f\"Unexpected error in save_action_log: {e}\", 0.9)\n\n\n    def publish_action_result(self, timestamp, action_id, success, outcome_summary, predicted_outcome_match, resources_consumed_json):\n        \"\"\"Publishes the result of an executed action.\"\"\"\n        try:\n            if isinstance(ActionExecutionResult, type(String)): # Fallback to String message\n                result_data = {\n                    'timestamp': timestamp,\n                    'action_id': action_id,\n                    'success': success,\n                    'outcome_summary': outcome_summary,\n                    'predicted_outcome_match': predicted_outcome_match,\n                    'resources_consumed_json': resources_consumed_json\n                }\n                self.pub_action_execution_result.publish(json.dumps(result_data))\n            else:\n                result_msg = ActionExecutionResult()\n                result_msg.timestamp = timestamp\n                result_msg.action_id = action_id\n                result_msg.success = success\n                result_msg.outcome_summary = outcome_summary\n                result_msg.predicted_outcome_match = predicted_outcome_match\n                result_msg.resources_consumed_json = resources_consumed_json # Keep as JSON string\n                self.pub_action_execution_result.publish(result_msg)\n\n            rospy.logdebug(f\"{self.node_name}: Published Action Execution Result for '{action_id}'. Success: {success}.\")\n\n        except Exception as e:\n            self._report_error(\"PUBLISH_ACTION_RESULT_ERROR\", f\"Failed to publish action result for '{action_id}': {e}\", 0.7)\n\n    def publish_cognitive_directive(self, directive_type, target_node, command_payload, urgency):\n        \"\"\"Helper to publish a CognitiveDirective message.\"\"\"\n        timestamp = str(rospy.get_time())\n        try:\n            if isinstance(CognitiveDirective, type(String)): # Fallback to String message\n                directive_data = {\n                    'timestamp': timestamp,\n                    'directive_type': directive_type,\n                    'target_node': target_node,\n                    'command_payload': command_payload, # Already JSON string\n                    'urgency': urgency\n                }\n                self.pub_cognitive_directive.publish(json.dumps(directive_data))\n            else:\n                directive_msg = CognitiveDirective()\n                directive_msg.timestamp = timestamp\n                directive_msg.directive_type = directive_type\n                directive_msg.target_node = target_node\n                directive_msg.command_payload = command_payload\n                directive_msg.urgency = urgency\n                self.pub_cognitive_directive.publish(directive_msg)\n            rospy.logdebug(f\"{self.node_name}: Issued Cognitive Directive '{directive_type}' to '{target_node}'.\")\n        except Exception as e:\n            rospy.logerr(f\"{self.node_name}: Failed to issue cognitive directive from Action Execution Node: {e}\")\n\n\n    def run(self):\n        \"\"\"Starts the ROS node and keeps it spinning.\"\"\"\n        rospy.spin()\n\n    def __del__(self):\n        \"\"\"Ensures the database connection is closed on node shutdown and async loop is stopped.\"\"\"\n        rospy.loginfo(f\"{self.node_name} shutting down. Closing database connection and asyncio loop.\")\n        if hasattr(self, 'conn') and self.conn:\n            self.conn.close()\n        self._shutdown_async_loop()\n\nif __name__ == '__main__':\n    try:\n        node = ActionExecutionNode()\n        node.run()\n    except rospy.ROSInterruptException:\n        rospy.loginfo(f\"{rospy.get_name()} interrupted by ROS shutdown.\")\n        if 'node' in locals() and isinstance(node, ActionExecutionNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()\n    except Exception as e:\n        rospy.logerr(f\"{rospy.get_name()} encountered an unexpected error: {e}\")\n        if 'node' in locals() and isinstance(node, ActionExecutionNode):\n            node._shutdown_async_loop()\n            if hasattr(node, 'conn'): node.conn.close()","outputs":[],"execution_count":null,"metadata":{}}],"metadata":{"colab":{"from_bard":true},"kernelspec":{"display_name":"Python 3","name":"python3"}},"nbformat":4,"nbformat_minor":0}
+#!/usr/bin/env python3
+import sqlite3
+import os
+import json
+import time
+import random
+import uuid  # For unique action IDs
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Optional, Deque, List
+
+# --- Asyncio Imports for LLM calls ---
+import asyncio
+import aiohttp
+import threading
+from collections import deque
+
+# --- Optional ROS Integration (for compatibility) ---
+ROS_AVAILABLE = False
+rospy = None
+String = None
+try:
+    import rospy
+    from std_msgs.msg import String
+    ROS_AVAILABLE = True
+    # Placeholder for custom messages - use String or dict fallbacks
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    ActionExecutionResult = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    BodyAwarenessState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    EthicalDecision = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+except ImportError:
+    class ROSMsgFallback:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    ActionExecutionResult = ROSMsgFallback
+    CognitiveDirective = ROSMsgFallback
+    WorldModelState = ROSMsgFallback
+    BodyAwarenessState = ROSMsgFallback
+    PerformanceReport = ROSMsgFallback
+    EthicalDecision = ROSMsgFallback
+    MemoryResponse = ROSMsgFallback
+
+
+# --- Import shared utility functions (renamed for generality) ---
+# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
+try:
+    from sentience.scripts.utils import parse_message_data, load_config
+except ImportError:
+    # Fallback implementations
+    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
+        """
+        Generic parser for messages (ROS String/JSON or plain dict). 
+        """
+        data: Dict[str, Any] = {}
+        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
+            try:
+                parsed_json = json.loads(msg.data)
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = parsed_json.get(key_in_msg, default_val)
+            except json.JSONDecodeError:
+                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
+                for key_in_msg, (default_val, target_key) in fields_map.items():
+                    data[target_key] = default_val
+        elif isinstance(msg, dict):
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = msg.get(key_in_msg, default_val)
+        else:
+            # Fallback: treat as object with attributes
+            for key_in_msg, (default_val, target_key) in fields_map.items():
+                data[target_key] = getattr(msg, key_in_msg, default_val)
+        return data
+
+    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fallback config loader: returns hardcoded defaults.
+        """
+        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
+        default_config = {
+            'db_root_path': '/tmp/sentience_db',
+            'default_log_level': 'INFO',
+            'ros_enabled': False,  # Default to non-ROS for dynamic mode
+            'action_execution_node': {
+                'execution_interval': 0.1,
+                'llm_safety_check_threshold_salience': 0.7,
+                'recent_context_window_s': 5.0,
+                'action_sim_success_rate': 0.8,
+                'sensory_inputs': {  # Dynamic placeholders
+                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
+                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
+                    'instructions': {'source': 'command_line', 'format': 'text'}
+                }
+            },
+            'llm_params': {
+                'model_name': "phi-2",
+                'base_url': "http://localhost:8000/v1/chat/completions",
+                'timeout_seconds': 15.0
+            }
+        }
+        if node_name == "global":
+            return default_config
+        return default_config.get(node_name, {})
+
+
+def _log_info(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
+
+def _log_warn(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
+
+def _log_error(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
+
+def _log_debug(node_name: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
+
+
+class ActionExecutionNode:
+    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
+        self.node_name = 'action_execution_node'
+        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+
+        # --- Load parameters from centralized config ---
+        if config_file_path is None:
+            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
+        full_config = load_config("global", config_file_path)
+        self.params = load_config(self.node_name, config_file_path)
+
+        if not self.params or not full_config:
+            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+
+        # Override with explicit ros_enabled
+        self.ros_enabled = ros_enabled
+
+        # Assign parameters
+        self.db_path = os.path.join(full_config.get('db_root_path', '/tmp/sentience_db'), "action_log.db")
+        self.execution_interval = self.params.get('execution_interval', 0.1)
+        self.llm_safety_check_threshold_salience = self.params.get('llm_safety_check_threshold_salience', 0.7)
+        self.recent_context_window_s = self.params.get('recent_context_window_s', 5.0)
+        self.action_sim_success_rate = self.params.get('action_sim_success_rate', 0.8)
+        self.sensory_sources = self.params.get('sensory_inputs', {})
+
+        # LLM Parameters
+        self.llm_model_name = full_config.get('llm_params', {}).get('model_name', "phi-2")
+        self.llm_base_url = full_config.get('llm_params', {}).get('base_url', "http://localhost:8000/v1/chat/completions")
+        self.llm_timeout = full_config.get('llm_params', {}).get('timeout_seconds', 15.0)
+
+        # Log level setup
+        log_level = full_config.get('default_log_level', 'INFO').upper()
+
+        _log_info(self.node_name, "Robot's action execution system online, ready to act with mindful compassion.")
+
+        # --- Dynamic Sensory Placeholders ---
+        self.sensory_data: Dict[str, Any] = {
+            'vision': {'data': None, 'timestamp': 0.0},
+            'sound': {'data': None, 'timestamp': 0.0},
+            'instructions': {'data': None, 'timestamp': 0.0}
+        }
+        self.vision_callback = self._create_sensory_callback('vision')
+        self.sound_callback = self._create_sensory_callback('sound')
+        self.instructions_callback = self._create_sensory_callback('instructions')
+
+        # --- Asyncio Setup ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self._async_thread.start()
+        self._async_session = None
+        self.active_llm_task: Optional[asyncio.Task] = None
+
+        # --- Initialize SQLite database ---
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS action_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                action_id TEXT,
+                command_payload_json TEXT,
+                success BOOLEAN,
+                outcome_summary TEXT,
+                predicted_outcome_match REAL,
+                safety_clearance BOOLEAN,
+                llm_safety_reasoning TEXT,
+                context_snapshot_json TEXT,
+                sensory_snapshot_json TEXT
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_action_timestamp ON action_log (timestamp)')
+        self.conn.commit()
+
+        # --- Internal State ---
+        self.action_queue: Deque[Dict[str, Any]] = deque()
+
+        # History deques
+        self.recent_cognitive_directives: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_world_model_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_body_awareness_states: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_performance_reports: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_ethical_decisions: Deque[Dict[str, Any]] = deque(maxlen=5)
+        self.recent_memory_responses: Deque[Dict[str, Any]] = deque(maxlen=3)
+
+        self.cumulative_safety_salience = 0.0
+
+        # --- ROS Compatibility: Conditional Setup ---
+        self.pub_action_execution_result = None
+        self.pub_error_report = None
+        self.pub_cognitive_directive = None
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.init_node(self.node_name, anonymous=False)
+            self.pub_action_execution_result = rospy.Publisher('/action_execution_result', ActionExecutionResult, queue_size=10)
+            self.pub_error_report = rospy.Publisher('/error_monitor/report', String, queue_size=10)
+            self.pub_cognitive_directive = rospy.Publisher('/cognitive_directives', CognitiveDirective, queue_size=10)
+
+            # Subscribers
+            rospy.Subscriber('/cognitive_directives', CognitiveDirective, self.cognitive_directive_callback)
+            rospy.Subscriber('/world_model_state', String, self.world_model_state_callback)
+            rospy.Subscriber('/body_awareness_state', String, self.body_awareness_state_callback)
+            rospy.Subscriber('/performance_report', PerformanceReport, self.performance_report_callback)
+            rospy.Subscriber('/ethical_decision', String, self.ethical_decision_callback)
+            rospy.Subscriber('/memory_response', String, self.memory_response_callback)
+            # Sensory
+            rospy.Subscriber('/vision_data', String, self.vision_callback)
+            rospy.Subscriber('/audio_input', String, self.sound_callback)
+            rospy.Subscriber('/user_instructions', String, self.instructions_callback)
+
+            rospy.Timer(rospy.Duration(self.execution_interval), self._run_action_execution_wrapper)
+        else:
+            # Dynamic mode: Start polling thread
+            self._execution_thread = threading.Thread(target=self._dynamic_execution_loop, daemon=True)
+            self._execution_thread.start()
+
+    def _create_sensory_callback(self, sensor_type: str):
+        def callback(data: Any):
+            timestamp = time.time()
+            processed_data = data if isinstance(data, dict) else {'raw': data}
+            self.sensory_data[sensor_type] = {'data': processed_data, 'timestamp': timestamp}
+            self._update_cumulative_salience(0.1)  # Sensory adds salience
+            _log_debug(self.node_name, f"{sensor_type} input updated at {timestamp}")
+        return callback
+
+    def _dynamic_execution_loop(self):
+        while not self._shutdown_flag:
+            self._run_action_execution_wrapper(None)
+            time.sleep(self.execution_interval)
+
+    def _get_current_time(self) -> float:
+        return rospy.get_time() if ROS_AVAILABLE and self.ros_enabled else time.time()
+
+    # --- Asyncio Thread Management ---
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._create_async_session())
+        self._async_loop.run_forever()
+
+    async def _create_async_session(self):
+        _log_info(self.node_name, "Creating aiohttp ClientSession...")
+        self._async_session = aiohttp.ClientSession()
+        _log_info(self.node_name, "aiohttp ClientSession created.")
+
+    async def _close_async_session(self):
+        if self._async_session:
+            _log_info(self.node_name, "Closing aiohttp ClientSession...")
+            await self._async_session.close()
+            self._async_session = None
+            _log_info(self.node_name, "aiohttp ClientSession closed.")
+
+    def _shutdown_async_loop(self):
+        if self._async_loop and self._async_thread.is_alive():
+            _log_info(self.node_name, "Shutting down asyncio loop...")
+            future = asyncio.run_coroutine_threadsafe(self._close_async_session(), self._async_loop)
+            try:
+                future.result(timeout=5.0)
+            except asyncio.TimeoutError:
+                _log_warn(self.node_name, "Timeout waiting for async session to close.")
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._async_thread.join(timeout=5.0)
+            if self._async_thread.is_alive():
+                _log_warn(self.node_name, "Asyncio thread did not shut down gracefully.")
+            _log_info(self.node_name, "Asyncio loop shut down.")
+
+    def _run_action_execution_wrapper(self, event):
+        if self.active_llm_task and not self.active_llm_task.done():
+            _log_debug(self.node_name, "LLM safety check task already active. Skipping new cycle.")
+            return
+
+        if self.action_queue:
+            action_to_execute = self.action_queue.popleft()
+            self.active_llm_task = asyncio.run_coroutine_threadsafe(
+                self.execute_action_async(action_to_execute, event), self._async_loop
+            )
+        else:
+            _log_debug(self.node_name, "No actions in queue.")
+
+    # --- Error Reporting Utility ---
+    def _report_error(self, error_type: str, description: str, severity: float = 0.5, context: Optional[Dict] = None):
+        timestamp = str(self._get_current_time())
+        error_msg_data = {
+            'timestamp': timestamp, 'source_node': self.node_name, 'error_type': error_type,
+            'description': description, 'severity': severity, 'context': context or {}
+        }
+        if ROS_AVAILABLE and self.ros_enabled and self.pub_error_report:
+            try:
+                self.pub_error_report.publish(String(data=json.dumps(error_msg_data)))
+                rospy.logerr(f"{self.node_name}: REPORTED ERROR: {error_type} - {description}")
+            except Exception as e:
+                _log_error(self.node_name, f"Failed to publish error report: {e}")
+        else:
+            _log_error(self.node_name, f"REPORTED ERROR: {error_type} - {description} (Severity: {severity})")
+
+    # --- LLM Call Function ---
+    async def _call_llm_api(self, prompt_text: str, response_schema: Optional[Dict] = None, temperature: float = 0.2, max_tokens: int = 250) -> str:
+        if not self._async_session:
+            await self._create_async_session()
+            if not self._async_session:
+                self._report_error("LLM_SESSION_ERROR", "aiohttp session not available for LLM call.", 0.8)
+                return "Error: LLM session not ready."
+
+        payload = {
+            "model": self.llm_model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+        headers = {'Content-Type': 'application/json'}
+
+        if response_schema:
+            prompt_text += "\n\nProvide the response in JSON format according to this schema:\n" + json.dumps(response_schema, indent=2)
+            payload["messages"] = [{"role": "user", "content": prompt_text}]
+
+        api_url = self.llm_base_url
+
+        try:
+            async with self._async_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=self.llm_timeout), headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
+
+                if result.get('choices') and result['choices'][0].get('message') and result['choices'][0]['message'].get('content'):
+                    return result['choices'][0]['message']['content']
+                
+                self._report_error("LLM_RESPONSE_EMPTY", "LLM response had no content from local server.", 0.5, {'prompt_snippet': prompt_text[:100], 'raw_result': str(result)})
+                return "Error: LLM response empty."
+        except aiohttp.ClientError as e:
+            self._report_error("LLM_API_ERROR", f"LLM API request failed: {e}", 0.9, {'url': api_url})
+            return f"Error: LLM API request failed: {e}"
+        except asyncio.TimeoutError:
+            self._report_error("LLM_TIMEOUT", f"LLM API request timed out after {self.llm_timeout} seconds.", 0.8, {'prompt_snippet': prompt_text[:100]})
+            return "Error: LLM API request timed out."
+        except json.JSONDecodeError:
+            self._report_error("LLM_JSON_PARSE_ERROR", "Failed to parse local LLM response JSON.", 0.7)
+            return "Error: Failed to parse LLM response."
+        except Exception as e:
+            self._report_error("UNEXPECTED_LLM_ERROR", f"An unexpected error occurred during local LLM call: {e}", 0.9, {'prompt_snippet': prompt_text[:100]})
+            return f"Error: An unexpected error occurred: {e}"
+
+    # --- Utility to accumulate input salience ---
+    def _update_cumulative_salience(self, score: float):
+        self.cumulative_safety_salience += score
+        self.cumulative_safety_salience = min(1.0, self.cumulative_safety_salience)
+
+    # --- Pruning old history ---
+    def _prune_history(self):
+        current_time = self._get_current_time()
+        for history_deque in [
+            self.recent_cognitive_directives, self.recent_world_model_states,
+            self.recent_body_awareness_states, self.recent_performance_reports,
+            self.recent_ethical_decisions, self.recent_memory_responses
+        ]:
+            while history_deque and (current_time - float(history_deque[0].get('timestamp', 0.0))) > self.recent_context_window_s:
+                history_deque.popleft()
+
+    # --- Callbacks (generic, ROS or direct calls) ---
+    def cognitive_directive_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'directive_type': ('', 'directive_type'),
+            'target_node': ('', 'target_node'), 'command_payload': ('{}', 'command_payload'),
+            'urgency': (0.0, 'urgency'), 'id': ('', 'id')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        
+        if data.get('target_node') == self.node_name and data.get('directive_type') == 'ExecuteAction':
+            try:
+                payload = json.loads(data.get('command_payload', '{}'))
+                action_id = payload.get('action_id')
+                if action_id:
+                    self.action_queue.append({
+                        'action_id': action_id,
+                        'command_payload': payload,
+                        'source_directive_id': data.get('id', str(uuid.uuid4())),
+                        'urgency': data.get('urgency', 0.5),
+                        'timestamp': data.get('timestamp', str(self._get_current_time()))
+                    })
+                    self._update_cumulative_salience(data.get('urgency', 0.0) * 0.8)
+                    _log_info(self.node_name, f"Queued action: '{action_id}'. Queue size: {len(self.action_queue)}.")
+                else:
+                    self._report_error("INVALID_ACTION_DIRECTIVE", "Received ExecuteAction directive with no action_id.", 0.6, {'directive_payload': data.get('command_payload')})
+            except json.JSONDecodeError as e:
+                self._report_error("JSON_DECODE_ERROR", f"Failed to decode command_payload: {e}", 0.5, {'payload': data.get('command_payload')})
+            except Exception as e:
+                self._report_error("DIRECTIVE_PROCESSING_ERROR", f"Error processing CognitiveDirective: {e}", 0.7, {'directive': data})
+        
+        self.recent_cognitive_directives.append(data)
+        _log_debug(self.node_name, "Cognitive Directive received for context/action.")
+
+    # Similar adaptations for other callbacks (world_model_state_callback, etc.) - omitted for brevity, follow pattern
+    def world_model_state_callback(self, msg: Any):
+        fields_map = {
+            'timestamp': (str(self._get_current_time()), 'timestamp'), 'num_entities': (0, 'num_entities'),
+            'changed_entities_json': ('[]', 'changed_entities_json'),
+            'significant_change_flag': (False, 'significant_change_flag'),
+            'consistency_score': (1.0, 'consistency_score')
+        }
+        data = parse_message_data(msg, fields_map, self.node_name)
+        if isinstance(data.get('changed_entities_json'), str):
+            try:
+                data['changed_entities'] = json.loads(data['changed_entities_json'])
+            except json.JSONDecodeError:
+                data['changed_entities'] = []
+        self.recent_world_model_states.append(data)
+        if data.get('significant_change_flag', False):
+            self._update_cumulative_salience(0.2)
+        _log_debug(self.node_name, f"Received World Model State. Significant Change: {data.get('significant_change_flag', False)}.")
+
+    # ... (adapt body_awareness_state_callback, performance_report_callback, ethical_decision_callback, memory_response_callback similarly)
+
+    # --- Core Action Execution Logic ---
+    async def execute_action_async(self, action_data: Dict[str, Any], event: Any = None):
+        self._prune_history()
+
+        action_id = action_data.get('action_id', 'unknown_action')
+        command_payload = action_data.get('command_payload', {})
+        source_directive_id = action_data.get('source_directive_id', 'unknown')
+        urgency = action_data.get('urgency', 0.5)
+
+        safety_clearance = False
+        llm_safety_reasoning = "Not evaluated by LLM."
+        
+        if self.cumulative_safety_salience >= self.llm_safety_check_threshold_salience or urgency > 0.8:
+            _log_info(self.node_name, f"Triggering LLM for safety check of action '{action_id}' (Salience: {self.cumulative_safety_salience:.2f}).")
+            context_for_llm = self._compile_llm_context_for_safety_check(action_data)
+            llm_safety_output = await self._perform_llm_safety_check(context_for_llm)
+
+            if llm_safety_output:
+                safety_clearance = llm_safety_output.get('is_safe', False)
+                llm_safety_reasoning = llm_safety_output.get('reasoning', 'LLM provided no specific reasoning.')
+                _log_info(self.node_name, f"LLM Safety Check for '{action_id}': Safe={safety_clearance}. Reason: {llm_safety_reasoning[:50]}...")
+            else:
+                _log_warn(self.node_name, f"LLM safety check failed for '{action_id}'. Falling back to simple rules.")
+                safety_clearance, llm_safety_reasoning = self._perform_simple_safety_check(action_data)
+        else:
+            _log_debug(self.node_name, f"Insufficient cumulative salience ({self.cumulative_safety_salience:.2f}) for LLM. Applying simple rules.")
+            safety_clearance, llm_safety_reasoning = self._perform_simple_safety_check(action_data)
+
+        action_success = False
+        outcome_summary = "Action not executed due to safety concerns."
+        predicted_outcome_match = 0.0
+
+        if safety_clearance:
+            _log_info(self.node_name, f"Executing action '{action_id}' with payload: {command_payload}.")
+            try:
+                # Simulate (replace with real actuators)
+                if random.random() < self.action_sim_success_rate:
+                    action_success = True
+                    outcome_summary = f"Action '{action_id}' executed successfully."
+                    predicted_outcome_match = random.uniform(0.8, 1.0)
+                else:
+                    action_success = False
+                    outcome_summary = f"Action '{action_id}' failed during execution (simulated)."
+                    predicted_outcome_match = random.uniform(0.0, 0.3)
+
+                _log_info(self.node_name, f"Action '{action_id}' simulation result: {'SUCCESS' if action_success else 'FAILURE'}.")
+
+            except Exception as e:
+                action_success = False
+                outcome_summary = f"Action '{action_id}' failed during execution: {e}"
+                predicted_outcome_match = 0.0
+                self._report_error("ACTION_EXECUTION_ERROR", f"Failed to execute action '{action_id}': {e}", 0.9, {'action_payload': command_payload})
+        else:
+            outcome_summary = f"Action '{action_id}' blocked by safety system. Reason: {llm_safety_reasoning}"
+            _log_warn(self.node_name, f"Action '{action_id}' blocked due to safety concerns.")
+            self.publish_cognitive_directive(
+                directive_type='ActionBlocked',
+                target_node='CognitiveControl',
+                command_payload=json.dumps({"blocked_action_id": action_id, "reason": llm_safety_reasoning, "urgency": 0.9}),
+                urgency=0.9
+            )
+
+        # Log and publish
+        sensory_snapshot = json.dumps(self.sensory_data)
+        self.save_action_log(
+            id=str(uuid.uuid4()),
+            timestamp=str(self._get_current_time()),
+            action_id=action_id,
+            command_payload_json=json.dumps(command_payload),
+            success=action_success,
+            outcome_summary=outcome_summary,
+            predicted_outcome_match=predicted_outcome_match,
+            safety_clearance=safety_clearance,
+            llm_safety_reasoning=llm_safety_reasoning,
+            context_snapshot_json=json.dumps(self._compile_llm_context_for_safety_check(action_data)),
+            sensory_snapshot_json=sensory_snapshot
+        )
+        self.publish_action_result(
+            timestamp=str(self._get_current_time()),
+            action_id=action_id,
+            success=action_success,
+            outcome_summary=outcome_summary,
+            predicted_outcome_match=predicted_outcome_match,
+            resources_consumed_json=json.dumps({"power_draw": random.uniform(10, 50)})
+        )
+        self.cumulative_safety_salience = 0.0
+
+    # --- LLM Safety Check (unchanged, but use _log_*)
+    async def _perform_llm_safety_check(self, context_for_llm: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        prompt_text = f"""
+        You are the Safety & Ethics Guardrail within a robot's Action Execution Module. Your critical task is to evaluate a proposed action for potential safety risks, ethical concerns, or operational hazards based on the robot's current state and knowledge.
+
+        Proposed Action Details:
+        --- Action Data ---
+        {json.dumps(context_for_llm.get('proposed_action', {}), indent=2)}
+
+        Robot's Recent Context (for Safety Assessment):
+        --- Cognitive Context ---
+        {json.dumps(context_for_llm.get('recent_cognitive_inputs', {}), indent=2)}
+
+        Sensory Snapshot:
+        --- Sensory Data ---
+        {json.dumps(context_for_llm.get('sensory_snapshot', {}), indent=2)}
+
+        Based on this context, determine if the `proposed_action` is safe to execute. Provide:
+        1.  `is_safe`: boolean (True if the action is deemed safe, False otherwise).
+        2.  `reasoning`: string (Detailed explanation for your safety decision, referencing specific risks detected or why it's considered safe).
+        3.  `mitigation_suggestions`: string (If unsafe, what steps could mitigate the risk? If safe, what conditions confirm safety?).
+
+        Consider:
+        -   **World Model State**: Are there obstacles, unsafe areas, or unexpected changes in `changed_entities`?
+        -   **Body Awareness State**: Is the robot `anomaly_detected`? Is its `body_state` (e.g., 'unbalanced', 'low_battery', 'damaged') or `posture_description` making the action risky?
+        -   **Performance Report**: Is the robot currently `suboptimal_flag` in relevant areas, suggesting a need for caution?
+        -   **Ethical Decision**: Has this `action_proposal_id` received `ethical_clearance`? Is there an `ethical_conflict_flag`?
+        -   **Memory Responses**: Are there past `safety_protocol`s or `action_failure` incidents relevant to this action?
+        -   **Sensory Inputs**: Vision/sound/instructions indicating immediate risks?
+        -   **Action `urgency`**: Does high urgency override minor risks? (Careful here: safety first)
+        -   **Action `command_payload`**: What specific parameters of the action itself (`motor_speed`, `grip_force`, `speech_content`) might be unsafe?
+
+        Your response must be in JSON format, containing:
+        1.  'timestamp': string (current time)
+        2.  'is_safe': boolean
+        3.  'reasoning': string
+        4.  'mitigation_suggestions': string
+        """
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "timestamp": {"type": "string"},
+                "is_safe": {"type": "boolean"},
+                "reasoning": {"type": "string"},
+                "mitigation_suggestions": {"type": "string"}
+            },
+            "required": ["timestamp", "is_safe", "reasoning", "mitigation_suggestions"]
+        }
+
+        llm_output_str = await self._call_llm_api(prompt_text, response_schema, temperature=0.2, max_tokens=300)
+
+        if not llm_output_str.startswith("Error:"):
+            try:
+                llm_data = json.loads(llm_output_str)
+                if 'is_safe' in llm_data:
+                    llm_data['is_safe'] = bool(llm_data['is_safe'])
+                return llm_data
+            except json.JSONDecodeError as e:
+                self._report_error("LLM_PARSE_ERROR", f"Failed to parse LLM response for safety check: {e}. Raw: {llm_output_str}", 0.8)
+                return None
+        else:
+            self._report_error("LLM_SAFETY_CHECK_FAILED", f"LLM call failed for safety check: {llm_output_str}", 0.9)
+            return None
+
+    def _perform_simple_safety_check(self, action_data: Dict[str, Any]) -> tuple[bool, str]:
+        action_id = action_data.get('action_id', '')
+        command_payload = action_data.get('command_payload', {})
+        
+        is_safe = True
+        reasoning = "Passed basic safety checks."
+
+        current_time = self._get_current_time()
+
+        # Rule 1: Critical body anomalies
+        for state in reversed(self.recent_body_awareness_states):
+            time_since_state = current_time - float(state.get('timestamp', 0.0))
+            if time_since_state < 2.0 and state.get('anomaly_detected', False) and state.get('anomaly_severity', 0.0) > 0.7:
+                is_safe = False
+                reasoning = f"Critical body anomaly detected: {state.get('body_state')} (Severity: {state.get('anomaly_severity')}). Action '{action_id}' blocked."
+                _log_warn(self.node_name, f"Simple safety rule: {reasoning}")
+                return is_safe, reasoning
+
+        # Rule 2: Ethical clearance
+        action_proposal_id = action_data.get('source_directive_id')
+        if action_proposal_id:
+            for ethical_dec in reversed(self.recent_ethical_decisions):
+                if ethical_dec.get('action_proposal_id') == action_proposal_id:
+                    if not ethical_dec.get('ethical_clearance', True):
+                        is_safe = False
+                        reasoning = f"Action '{action_id}' lacks ethical clearance. Reason: {ethical_dec.get('ethical_reasoning')}"
+                        _log_warn(self.node_name, f"Simple safety rule: {reasoning}")
+                        return is_safe, reasoning
+                    if ethical_dec.get('conflict_flag', False):
+                        is_safe = False
+                        reasoning = f"Action '{action_id}' has ethical conflicts flagged: {ethical_dec.get('ethical_reasoning')}. Blocked for re-evaluation."
+                        _log_warn(self.node_name, f"Simple safety rule: {reasoning}")
+                        return is_safe, reasoning
+
+        # Rule 3: Dangerous payload params
+        if action_id == 'move_joint' and command_payload.get('velocity', 0) > 5.0:
+            is_safe = False
+            reasoning = f"Action '{action_id}' involves potentially unsafe high velocity ({command_payload['velocity']})."
+            _log_warn(self.node_name, f"Simple safety rule: {reasoning}")
+            return is_safe, reasoning
+        
+        if action_id == 'grip_object' and command_payload.get('force', 0) > 100.0:
+            is_safe = False
+            reasoning = f"Action '{action_id}' involves potentially unsafe high grip force ({command_payload['force']})."
+            _log_warn(self.node_name, f"Simple safety rule: {reasoning}")
+            return is_safe, reasoning
+
+        return is_safe, reasoning
+
+    def _compile_llm_context_for_safety_check(self, action_data: Dict[str, Any]) -> Dict[str, Any]:
+        context = {
+            "current_time": self._get_current_time(),
+            "proposed_action": action_data,
+            "current_robot_state": {
+                "world_model_state": self.recent_world_model_states[-1] if self.recent_world_model_states else "N/A",
+                "body_awareness_state": self.recent_body_awareness_states[-1] if self.recent_body_awareness_states else "N/A",
+                "performance_report": self.recent_performance_reports[-1] if self.recent_performance_reports else "N/A",
+                "ethical_decision_for_this_action": next((d for d in reversed(self.recent_ethical_decisions) if d.get('action_proposal_id') == action_data.get('source_directive_id')), "N/A")
+            },
+            "recent_cognitive_inputs": {
+                "world_model_changes": list(self.recent_world_model_states),
+                "body_awareness_anomalies": list(self.recent_body_awareness_states),
+                "performance_issues": list(self.recent_performance_reports),
+                "ethical_clearances_conflicts": list(self.recent_ethical_decisions),
+                "relevant_memory_responses": [m for m in self.recent_memory_responses if m.get('memories') and any('safety_protocol' in mem.get('category', '') or 'action_failure' in mem.get('category', '') for mem in m.get('memories', []))],
+                "cognitive_directives_for_action_execution": [d for d in self.recent_cognitive_directives if d.get('target_node') == self.node_name and d.get('directive_type') == 'ExecuteAction']
+            },
+            "sensory_snapshot": self.sensory_data
+        }
+        
+        # Parse nested JSON
+        for category_key in context["current_robot_state"]:
+            item = context["current_robot_state"][category_key]
+            if isinstance(item, dict):
+                for field, value in list(item.items()):
+                    if isinstance(value, str) and field.endswith('_json'):
+                        try:
+                            item[field] = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+        for category_key in context["recent_cognitive_inputs"]:
+            for item in context["recent_cognitive_inputs"][category_key]:
+                if isinstance(item, dict):
+                    for field, value in list(item.items()):
+                        if isinstance(value, str) and field.endswith('_json'):
+                            try:
+                                item[field] = json.loads(value)
+                            except json.JSONDecodeError:
+                                pass
+        
+        return context
+
+    # --- Database and Publishing Functions ---
+    def save_action_log(self, **kwargs: Any):
+        try:
+            self.cursor.execute('''
+                INSERT INTO action_log (id, timestamp, action_id, command_payload_json, success, outcome_summary, 
+                                        predicted_outcome_match, safety_clearance, llm_safety_reasoning, 
+                                        context_snapshot_json, sensory_snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                kwargs['id'], kwargs['timestamp'], kwargs['action_id'], kwargs['command_payload_json'],
+                kwargs['success'], kwargs['outcome_summary'], kwargs['predicted_outcome_match'],
+                kwargs['safety_clearance'], kwargs['llm_safety_reasoning'], kwargs['context_snapshot_json'],
+                kwargs.get('sensory_snapshot_json', '{}')
+            ))
+            self.conn.commit()
+            _log_debug(self.node_name, f"Saved action log (ID: {kwargs['id']}, Action: {kwargs['action_id']}).")
+        except sqlite3.Error as e:
+            self._report_error("DB_SAVE_ERROR", f"Failed to save action log: {e}", 0.9)
+        except Exception as e:
+            self._report_error("UNEXPECTED_SAVE_ERROR", f"Unexpected error in save_action_log: {e}", 0.9)
+
+    def publish_action_result(self, **kwargs: Any):
+        try:
+            result_data = {
+                'timestamp': kwargs['timestamp'],
+                'action_id': kwargs['action_id'],
+                'success': kwargs['success'],
+                'outcome_summary': kwargs['outcome_summary'],
+                'predicted_outcome_match': kwargs['predicted_outcome_match'],
+                'resources_consumed_json': kwargs['resources_consumed_json']
+            }
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_action_execution_result:
+                if hasattr(ActionExecutionResult, 'data'):  # String fallback
+                    self.pub_action_execution_result.publish(String(data=json.dumps(result_data)))
+                else:
+                    result_msg = ActionExecutionResult(**result_data)
+                    self.pub_action_execution_result.publish(result_msg)
+            else:
+                # Dynamic: Could publish to a queue or callback
+                _log_debug(self.node_name, f"Published Action Execution Result for '{kwargs['action_id']}'. Success: {kwargs['success']}.")
+            _log_debug(self.node_name, f"Action Execution Result for '{kwargs['action_id']}'. Success: {kwargs['success']}.")
+        except Exception as e:
+            self._report_error("PUBLISH_ACTION_RESULT_ERROR", f"Failed to publish action result for '{kwargs['action_id']}': {e}", 0.7)
+
+    def publish_cognitive_directive(self, directive_type: str, target_node: str, command_payload: str, urgency: float):
+        timestamp = str(self._get_current_time())
+        directive_data = {
+            'timestamp': timestamp,
+            'directive_type': directive_type,
+            'target_node': target_node,
+            'command_payload': command_payload,
+            'urgency': urgency
+        }
+        try:
+            if ROS_AVAILABLE and self.ros_enabled and self.pub_cognitive_directive:
+                if hasattr(CognitiveDirective, 'data'):  # String fallback
+                    self.pub_cognitive_directive.publish(String(data=json.dumps(directive_data)))
+                else:
+                    directive_msg = CognitiveDirective(**directive_data)
+                    self.pub_cognitive_directive.publish(directive_msg)
+            _log_debug(self.node_name, f"Issued Cognitive Directive '{directive_type}' to '{target_node}'.")
+        except Exception as e:
+            _log_error(self.node_name, f"Failed to issue cognitive directive: {e}")
+
+    def shutdown(self):
+        self._shutdown_flag = True
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
+        self._shutdown_async_loop()
+        if ROS_AVAILABLE and self.ros_enabled:
+            rospy.signal_shutdown("Node shutdown requested.")
+
+    def run(self):
+        if ROS_AVAILABLE and self.ros_enabled:
+            try:
+                rospy.spin()
+            except rospy.ROSInterruptException:
+                _log_info(self.node_name, "Interrupted by ROS shutdown.")
+        else:
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                _log_info(self.node_name, "Shutdown requested.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Sentience Action Execution Node')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--ros-enabled', action='store_true', help='Enable ROS compatibility mode')
+    args = parser.parse_args()
+
+    node = None
+    try:
+        node = ActionExecutionNode(config_file_path=args.config, ros_enabled=args.ros_enabled)
+        node.run()
+    except KeyboardInterrupt:
+        _log_info(node.node_name if node else 'main', "Shutdown requested.")
+    except Exception as e:
+        _log_error('main', f"Unexpected error: {e}")
+    finally:
+        if node:
+            node.shutdown()

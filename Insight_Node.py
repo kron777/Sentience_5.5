@@ -1,84 +1,189 @@
-import json
+#!/usr/bin/env python3
+"""
+InsightNode – ROS-free, asyncio-first
+Generates node suggestions from awareness + conversation + dreaming
+"""
+from __future__ import annotations
 
+import argparse
+import asyncio
+import json
+import logging
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Protocol
+
+import aiohttp
+from aiohttp import web
+
+# --------------------------------------------------------------------------- #
+# Logging                                                                     #
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("Insight-Node")
+
+# --------------------------------------------------------------------------- #
+# Protocols (for type-safe mocking or ROS bridging)                          #
+# --------------------------------------------------------------------------- #
+class AwarenessProvider(Protocol):
+    def get_state_description(self) -> str: ...
+
+class ConversationProvider(Protocol):
+    def get_recent_dialogue(self) -> str: ...
+
+class DreamingProvider(Protocol):
+    def get_recent_dream(self) -> str: ...
+
+class LLMProvider(Protocol):
+    async def query(self, prompt: str) -> str: ...
+
+# --------------------------------------------------------------------------- #
+# InsightNode                                                                 #
+# --------------------------------------------------------------------------- #
 class InsightNode:
-    def __init__(self, awareness, conversation, dreaming, llm):
+    """
+    ROS-free insight engine.
+    Same public API as original.
+    """
+
+    def __init__(
+        self,
+        awareness: AwarenessProvider,
+        conversation: ConversationProvider,
+        dreaming: DreamingProvider,
+        llm: LLMProvider,
+    ):
         self.awareness = awareness
         self.conversation = conversation
         self.dreaming = dreaming
         self.llm = llm
 
-    def gather_context(self):
+    # ------------------------------------------------------------------ #
+    # Public API (unchanged signatures)                                  #
+    # ------------------------------------------------------------------ #
+    def gather_context(self) -> str:
         awareness_text = self.awareness.get_state_description()
         conversation_text = self.conversation.get_recent_dialogue()
         dreaming_text = self.dreaming.get_recent_dream()
-        combined = (
+        return (
             f"Robot Awareness:\n{awareness_text}\n\n"
             f"Recent Conversation:\n{conversation_text}\n\n"
             f"Dreaming Output:\n{dreaming_text}\n"
         )
-        return combined
 
-    def construct_prompt(self, context):
-        prompt = (
+    def construct_prompt(self, context: str) -> str:
+        return (
             f"Given the robot's current situation and context below:\n{context}\n\n"
             "Identify areas where the robot can improve itself by creating new functional nodes. "
             "For each suggested node, provide a name and a short description. "
             "Return the response in valid JSON format as:\n"
             "{\n  \"nodes\": [\n    {\"name\": \"NodeName\", \"spec\": \"Description\"}, ... ]\n}\n"
         )
-        return prompt
 
-    def analyze(self):
+    async def analyze(self) -> Dict[str, Any]:
         context = self.gather_context()
         prompt = self.construct_prompt(context)
-        raw_response = self.llm.query(prompt)
-        # Assuming raw_response is a string, try to parse JSON
+        raw_response = await self.llm.query(prompt)
         try:
             suggestions = json.loads(raw_response)
         except (json.JSONDecodeError, TypeError):
-            print("Warning: LLM response invalid JSON, returning empty suggestions.")
+            logger.warning("LLM response not valid JSON – returning empty")
             suggestions = {"nodes": []}
         return suggestions
 
+    # ------------------------------------------------------------------ #
+    # HTTP service (optional)                                            #
+    # ------------------------------------------------------------------ #
+    async def _http_analyze(self, request: web.Request) -> web.Response:
+        suggestions = await self.analyze()
+        return web.json_response(suggestions)
 
-# Mock Components for demonstration
+    def build_app(self) -> web.Application:
+        app = web.Application()
+        app.add_routes([web.get("/analyze", self._http_analyze)])
+        return app
 
+
+# --------------------------------------------------------------------------- #
+# Stand-alone LLM adapters                                                    #
+# --------------------------------------------------------------------------- #
+class MockLLM:
+    """Synchronous mock – wrap for async usage."""
+
+    async def query(self, prompt: str) -> str:
+        logger.debug("LLM prompt:\n%s", prompt)
+        await asyncio.sleep(0.1)  # simulate network
+        return json.dumps(
+            {
+                "nodes": [
+                    {"name": "EnergyManagerNode", "spec": "Manage battery usage efficiently."},
+                    {"name": "TaskSchedulerNode", "spec": "Optimise task order to meet deadlines."},
+                ]
+            }
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Mock providers (identical to original)                                      #
+# --------------------------------------------------------------------------- #
 class MockAwareness:
-    def get_state_description(self):
+    def get_state_description(self) -> str:
         return "Battery drains too quickly and task scheduling is inefficient."
 
+
 class MockConversation:
-    def get_recent_dialogue(self):
+    def get_recent_dialogue(self) -> str:
         return "User mentioned that tasks are often late and system overheats."
 
+
 class MockDreaming:
-    def get_recent_dream(self):
+    def get_recent_dream(self) -> str:
         return "Imagined a node balancing power usage dynamically."
 
-class MockLLM:
-    def query(self, prompt):
-        print(f"LLM Prompt:\n{prompt}\n")
-        # Example valid JSON string response from LLM
-        return """
-        {
-            "nodes": [
-                {"name": "EnergyManagerNode", "spec": "Manage battery usage efficiently to extend runtime."},
-                {"name": "TaskSchedulerNode", "spec": "Optimize task execution order to meet deadlines."}
-            ]
-        }
-        """
 
-# Example usage
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Sentience 5.0 – InsightNode (ROS-free)")
+    p.add_argument("--serve", action="store_true", help="run HTTP service")
+    p.add_argument("--port", type=int, default=8084, help="HTTP port")
+    return p
 
-if __name__ == "__main__":
+
+# --------------------------------------------------------------------------- #
+ Entry-point                                                               #
+# --------------------------------------------------------------------------- #
+async def amain() -> None:
+    args = build_parser().parse_args()
+
+    # wire mocks – replace with real providers via CLI or env vars later
     awareness = MockAwareness()
     conversation = MockConversation()
     dreaming = MockDreaming()
     llm = MockLLM()
 
-    insight = InsightNode(awareness, conversation, dreaming, llm)
-    suggestions = insight.analyze()
+    node = InsightNode(awareness, conversation, dreaming, llm)
 
-    print("InsightNode Suggestions:")
-    for node in suggestions.get("nodes", []):
-        print(f"- {node['name']}: {node['spec']}")
+    if args.serve:
+        app = node.build_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", args.port)
+        await site.start()
+        logger.info("Insight HTTP service on :%d", args.port)
+        await asyncio.Event().wait()  # forever
+    else:
+        suggestions = await node.analyze()
+        print("InsightNode Suggestions:")
+        for n in suggestions.get("nodes", []):
+            print(f"- {n['name']}: {n['spec']}")
+
+
+if __name__ == "__main__":
+    asyncio.run(amain())

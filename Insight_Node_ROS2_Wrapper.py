@@ -1,49 +1,48 @@
+#!/usr/bin/env python3
+"""
+ROS 2 bridge that talks to the stand-alone Insight HTTP service
+"""
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from example_interfaces.srv import Trigger
+import aiohttp
+import asyncio
+import threading
 import json
 
-# Assuming your InsightNode class is implemented as `InsightNode` (import or define here)
-# For demonstration, I’ll inline a minimal mock version
-
-class InsightNodeCore:
-    def analyze(self):
-        # Replace with actual analyze logic
-        return {
-            "nodes": [
-                {"name": "EnergyManagerNode", "spec": "Manage battery efficiently."},
-                {"name": "TaskSchedulerNode", "spec": "Optimize task scheduling."}
-            ]
-        }
-
-class InsightNodeROS(Node):
+class InsightROS2Bridge(Node):
     def __init__(self):
         super().__init__('insight_node')
-        self.insight_core = InsightNodeCore()
+        self.declare_parameter("service_url", "http://localhost:8086")
+        self.url = self.get_parameter("service_url").value
 
         self.publisher_ = self.create_publisher(String, 'insight/suggestions', 10)
         self.srv = self.create_service(Trigger, 'insight/analyze', self.handle_analyze_request)
 
-        self.get_logger().info("InsightNode ROS started.")
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
 
     def handle_analyze_request(self, request, response):
-        self.get_logger().info("Analyze service called.")
-        suggestions = self.insight_core.analyze()
-        suggestions_str = json.dumps(suggestions)
+        future = asyncio.run_coroutine_threadsafe(self._call_analyze(), self.loop)
+        result = future.result()
         response.success = True
-        response.message = suggestions_str
+        response.message = json.dumps(result)
 
-        # Also publish suggestions
         msg = String()
-        msg.data = suggestions_str
+        msg.data = response.message
         self.publisher_.publish(msg)
-
         return response
+
+    async def _call_analyze(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.url}/analyze") as resp:
+                return await resp.json()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = InsightNodeROS()
+    node = InsightROS2Bridge()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
