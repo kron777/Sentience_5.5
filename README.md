@@ -24,7 +24,7 @@ Sentience_5.0 is proprietary software:
 - Non-commercial spiritual and experimental use  
 
 💵 Commercial Use: Requires License  
-$99 per installation / deployment  
+$90,900 per installation / deployment  
 Contact: zenlightbulb@gmail.com
 
 See LICENSE for full terms.
