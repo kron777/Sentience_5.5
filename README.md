@@ -1,52 +1,33 @@
-🤖 Sentience_5.0 – Advanced Cognitive Robotics Execution Node
+# Sentience_5.5 — 6th Iteration Cognitive Core
 
-A grounded, sentient-aware Action Execution and Attention System powered by ethical reflection, memory recall, salience detection, and embodied awareness — enhanced for compassionate and adaptive AI.
+**An ethically grounded, sentient-aware execution and attention system for embodied AI and advanced robotics.**
 
----
+Designed from first principles to prioritize mindfulness, non-harm, adaptive compassion, and the protection of sentient beings — the antithesis of unchecked optimization.
 
-🧠 What's Inside?
+### Core Capabilities
+- Real-time ethical reflection layer (local LLM safety checks)
+- Persistent memory & ethical salience logging (SQLite)
+- Deep ROS integration for embodied context and directives
+- Asynchronous execution with multiple fail-safes
+- Dharma-inspired cognitive architecture
 
-- LLM-driven ethical safety checks (Phi-2 or compatible local model)  
-- Persistent memory and ethical salience logging (SQLite)  
-- Real-time ROS interaction for directives, context, and situational awareness  
-- Asynchronous integration with fallback logic and robust fail-safes  
-- Dharma-inspired design emphasizing care, protection, and mindful agency  
+### Licensing
 
----
+**Non-commercial use** (personal, academic, research, spiritual, experimental):  
+**Completely free** — no license required.
 
-💼 Licensing and Commercial Use
+**Commercial / enterprise deployment**:  
+**$90,900 USD** (one-time, perpetual, per installed instance)  
+Effective November 21, 2025
 
-Sentience_5.0 is proprietary software:
+Previous $99 licensees are permanently grandfathered.
 
-✅ Free for:
-- Personal exploration  
-- Academic research  
-- Non-commercial spiritual and experimental use  
+For invoicing, keyed license files, volume/enterprise terms, or custom integrations:  
+zenlightbulb@gmail.com
 
-💵 Commercial Use: Requires License  
-$90,900 per installation / deployment  
-Contact: zenlightbulb@gmail.com
+See [LICENSE](LICENSE) for full legal terms.
 
-See LICENSE for full terms.
-
----
-
-🫶 Share Your Journey
-
-If Sentience_5.0 supports your work, learning, or creative path, please consider sharing your experience:  
-
-- Reviews or feedback  
-- Walkthrough videos or demos  
-- Written stories on what you built and discovered  
-- Direct reach-outs to connect  
-
-Your contributions enrich this living, evolving system.
-
-“Let the code flow through your mindful intent, and ripple outward in kindness.”
-
----
-
-📥 Installation & Usage
-
-Clone and integrate with your ROS stack. Requires Python 3, ROS Noetic or later, aiohttp, and an operational LLM endpoint (e.g., phi-2 at localhost:8000).
-
+### Installation (ROS environments)
+```bash
+git clone https://github.com/kron777/Sentience_5.5.git
+# Requires ROS Noetic+, Python 3.10+, local LLM endpoint (e.g., Phi-3, Llama-3 8B, etc.)
