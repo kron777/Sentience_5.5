@@ -1,132 +1,44 @@
-# Sentience_5.0 Proprietary Software License Agreement
+# Sentience_5.5 – License Agreement
+© 2025 kron777 – All rights reserved.
 
-**Version 1.0 — Effective June 27, 2025**  
-**Copyright © Jon, 2025. All rights reserved.**
+## 1. Non-Commercial Use (FREE – No license required)
+You may freely use, modify, and deploy Sentience_5.5 for:
+- Personal projects
+- Academic or educational purposes
+- Non-profit research
+- Spiritual or experimental exploration
+- Any use that does **not** generate revenue or operate in a commercial context
 
----
+No permission or payment is needed for the above.
 
-## IMPORTANT NOTICE
+## 2. Commercial Use – $90,900 USD per installed instance
+Any deployment in a revenue-generating, business, enterprise, government, military, or for-profit context requires a paid commercial license.
 
-By downloading, accessing, installing, or using this Software in any form, you confirm that you have read, understood, and irrevocably agreed to be bound by all terms and conditions outlined in this License Agreement.  
-If you do not agree to these terms, do not download, install, use, copy, or access the Software.
+Current fee (effective November 21, 2025):  
+**$90,900 USD (ninety thousand nine hundred United States dollars)**  
+one-time payment per active installation / deployment.
 
----
+This is a perpetual, non-exclusive, non-transferable license for one running instance.
 
-## 1. Grant of License
+- Volume licensing, site licenses, or custom terms: contact zenlightbulb@gmail.com
+- Previous purchasers who paid $99 under the old pricing are permanently grandfathered at their original rate and owe nothing further.
 
-This Software (“Sentience_5.0”) is proprietary software developed by the Author. Upon lawful acquisition of this Software, the Author grants the individual user (“You”) a **limited, non-exclusive, non-transferable, non-sublicensable, revocable license** to:
+## 3. How to obtain a commercial license
+Email: zenlightbulb@gmail.com  
+You will receive an invoice and a signed license key/file unique to your deployment.
 
-- Possess and use **a single copy** of the Software for **personal, non-commercial purposes only**.
+No commercial use is permitted without a valid paid license in place.
 
-You do not acquire any ownership of the Software under this license.
+## 4. Restrictions (applies to all users)
+- You may not resell, sublicense, or distribute Sentience_5.5 as a standalone commercial product.
+- You may not remove or obscure this license notice.
+- You may not use Sentience_5.5 in any application that directly causes physical harm to sentient beings.
 
----
-
-## 2. Strict Usage Limitations
-
-Unless you have received **explicit written permission** from the Author, you may **not**:
-
-- Copy, duplicate, mirror, or distribute the Software in any form.  
-- Share the Software with any other person or party, either publicly or privately.  
-- Publish or host the Software online, including via repositories, file sharing sites, or email.  
-- Modify, translate, reverse engineer, decompile, or create derivative works based on the Software.  
-- Sell, rent, sublicense, or use the Software in any commercial or professional context.  
-- Use the Software as part of a paid product, platform, course, or service.
-
-**Any of the above actions constitute a violation of this Agreement and may result in legal prosecution.**
-
----
-
-## 3. One License Per Individual
-
-- This license applies strictly to **one (1) natural person**.  
-- Each person must obtain their own valid copy from the Author or an authorized source.  
-- This license is **non-transferable** and cannot be shared between users, devices, or entities.
+## 5. No Warranty
+This software is provided "AS IS" without warranty of any kind. The author is not liable for any damages arising from its use.
 
 ---
 
-## 4. Commercial Use Strictly Prohibited Without License
+By using Sentience_5.5 you agree to the terms above.
 
-Any use of the Software by:
-
-- Companies, businesses, consultants, or commercial entities  
-- Government agencies  
-- Academic institutions or research labs  
-- Any professional, monetized, or collaborative project
-
-**requires a separate, explicit commercial license.**
-
-To request a commercial license, contact: **zenlightbulb@gmail.com**
-
-Unauthorized commercial use is a **breach of contract** and a violation of international copyright law.
-
----
-
-## 5. Intellectual Property Rights
-
-The Software is protected by copyright and other intellectual property laws.
-
-- All rights not expressly granted in this Agreement are reserved by the Author.  
-- You may not claim ownership or misrepresent authorship of the Software or any part thereof.  
-- You may not use the Author’s name or branding without written permission.
-
----
-
-## 6. Enforcement and Penalties
-
-Violation of this Agreement may result in:
-
-- **Immediate revocation** of the license  
-- **Civil and criminal prosecution**  
-- **Financial damages**, including legal costs and statutory penalties
-
-The Author reserves the right to pursue legal remedies to protect their rights and prevent further misuse.
-
----
-
-## 7. Disclaimer of Warranty
-
-The Software is provided **"AS IS"**, with no warranties or guarantees of any kind, express or implied.  
-The Author disclaims all liability for:
-
-- Performance issues or bugs  
-- Data loss  
-- Suitability for specific tasks or devices
-
-Use of the Software is entirely at your own risk.
-
----
-
-## 8. Limitation of Liability
-
-To the fullest extent allowed by law, the Author shall not be liable for:
-
-- Any direct, indirect, incidental, or consequential damages  
-- Any loss of profits, data, goodwill, or opportunity  
-- Claims arising from your use, misuse, or inability to use the Software
-
----
-
-## 9. Governing Law
-
-This Agreement is governed by and shall be construed in accordance with the laws of **South Africa**.  
-All disputes shall be subject to the exclusive jurisdiction of courts in that jurisdiction.
-
----
-
-## 10. Entire Agreement
-
-This Agreement constitutes the entire legal agreement between You and the Author regarding this Software.  
-If any section is found to be unenforceable, the remainder shall remain in full effect.
-
----
-
-## 11. Contact Information
-
-To request commercial licensing, report violations, or ask questions:
-
-📧 Email: **zenlightbulb@gmail.com**
-
----
-
-🛡️ _Respect the rights of creators. Unauthorized use of this software is software piracy._
+For questions or custom licensing: zenlightbulb@gmail.com
