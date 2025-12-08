@@ -15,7 +15,7 @@ No permission or payment is needed for the above.
 Any deployment in a revenue-generating, business, enterprise, government, military, or for-profit context requires a paid commercial license.
 
 Current fee (effective November 21, 2025):  
-**$90,900 USD (ninety thousand nine hundred United States dollars)**  
+**$99,990 USD (ninety thousand nine hundred United States dollars)**  
 one-time payment per active installation / deployment.
 
 This is a perpetual, non-exclusive, non-transferable license for one running instance.
