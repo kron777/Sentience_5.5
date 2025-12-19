@@ -15,7 +15,7 @@ Viewing the source code in this repository does not grant any right to use, run,
 Any use, execution, modification, deployment, distribution, or incorporation of Sentience_5.5 (or any derivative work) in any context whatsoever — including but not limited to personal, academic, non-profit, research, business, enterprise, government, or military applications — requires a paid commercial license.
 
 Fee (effective December 19, 2025):  
-**$99,990 USD** (ninety-nine thousand nine hundred ninety United States dollars)  
+**$999,990 USD** (ninety-nine thousand nine hundred ninety United States dollars)  
 one-time perpetual payment per active installation/deployment/instance.
 
 This grants a perpetual, non-exclusive, non-transferable, non-sublicensable license for one running instance only.
