@@ -1,44 +1,52 @@
 # Sentience_5.5 – License Agreement
+
 © 2025 kron777 – All rights reserved.
 
-## 1. Non-Commercial Use (FREE – No license required)
-You may freely use, modify, and deploy Sentience_5.5 for:
-- Personal projects
-- Academic or educational purposes
-- Non-profit research
-- Spiritual or experimental exploration
-- Any use that does **not** generate revenue or operate in a commercial context
+This software is proprietary and confidential. No use of any kind is permitted without a paid license.
 
-No permission or payment is needed for the above.
+## 1. No Free Use Permitted
 
-## 2. Commercial Use – $90,900 USD per installed instance
-Any deployment in a revenue-generating, business, enterprise, government, military, or for-profit context requires a paid commercial license.
+There is no free license, trial, evaluation, personal, academic, non-profit, research, educational, experimental, or any other non-paid use allowed.
 
-Current fee (effective November 21, 2025):  
-**$99,990 USD (ninety thousand nine hundred United States dollars)**  
-one-time payment per active installation / deployment.
+Viewing the source code in this repository does not grant any right to use, run, modify, copy, distribute, or deploy the software.
 
-This is a perpetual, non-exclusive, non-transferable license for one running instance.
+## 2. Commercial License Required for All Use
 
-- Volume licensing, site licenses, or custom terms: contact zenlightbulb@gmail.com
-- Previous purchasers who paid $99 under the old pricing are permanently grandfathered at their original rate and owe nothing further.
+Any use, execution, modification, deployment, distribution, or incorporation of Sentience_5.5 (or any derivative work) in any context whatsoever — including but not limited to personal, academic, non-profit, research, business, enterprise, government, or military applications — requires a paid commercial license.
 
-## 3. How to obtain a commercial license
-Email: zenlightbulb@gmail.com  
-You will receive an invoice and a signed license key/file unique to your deployment.
+Fee (effective December 19, 2025):  
+**$99,990 USD** (ninety-nine thousand nine hundred ninety United States dollars)  
+one-time perpetual payment per active installation/deployment/instance.
 
-No commercial use is permitted without a valid paid license in place.
+This grants a perpetual, non-exclusive, non-transferable, non-sublicensable license for one running instance only.
 
-## 4. Restrictions (applies to all users)
-- You may not resell, sublicense, or distribute Sentience_5.5 as a standalone commercial product.
-- You may not remove or obscure this license notice.
+- Volume licensing, site licenses, source code access, or custom terms: contact zenlightbulb@gmail.com
+- Previous purchasers under any prior pricing are permanently grandfathered at their original terms.
+
+## 3. Obtaining a License
+
+Email zenlightbulb@gmail.com to discuss terms, receive an invoice, and obtain a signed license agreement and unique license key/file tied to your deployment.
+
+No use of the software is permitted without a fully executed paid license agreement in place.
+
+## 4. Restrictions
+
+- You may not use, run, modify, copy, distribute, or deploy the software without a valid paid license.
+- You may not resell, sublicense, lease, or distribute Sentience_5.5 (or any part of it) as a standalone product or service.
+- You may not remove, alter, or obscure this license notice.
 - You may not use Sentience_5.5 in any application that directly causes physical harm to sentient beings.
+- Reverse engineering, decompilation, or disassembly is prohibited except to the extent permitted by applicable law.
 
-## 5. No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not liable for any damages arising from its use.
+## 5. No Warranty & Limitation of Liability
+
+The software is provided "AS IS" without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement.
+
+The author shall not be liable for any direct, indirect, incidental, special, exemplary, or consequential damages arising from any use or inability to use the software.
 
 ---
 
-By using Sentience_5.5 you agree to the terms above.
+By viewing, accessing, downloading, or otherwise interacting with this repository or the software, you acknowledge and agree to be bound by these terms.
 
-For questions or custom licensing: zenlightbulb@gmail.com
+All rights not expressly granted are reserved by kron777.
+
+For licensing inquiries: zenlightbulb@gmail.com
