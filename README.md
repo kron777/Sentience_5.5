@@ -17,7 +17,7 @@ Designed from first principles to prioritize mindfulness, non-harm, adaptive com
 **Completely free** — no license required.
 
 **Commercial / enterprise deployment**:  
-**$90,900 USD** (one-time, perpetual, per installed instance)  
+**$990,900 USD** (one-time, perpetual, per installed instance)  
 Effective November 21, 2025
 
 Previous $99 licensees are permanently grandfathered.
