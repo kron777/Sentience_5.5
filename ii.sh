@@ -1,99 +1,128 @@
-#!/usr/bin/env bash
-# ii.sh – “init & ingest” – turn the current folder into a fresh GitHub repo
-# ---------------------------------------------------------------------------
-set -euo pipefail
+#!/bin/bash
+# ii.sh - Sentience 5.5 Installation and Initialization Script
+# This script sets up the entire Sentience system:
+# - Creates project directory
+# - Installs dependencies
+# - Installs Ollama if not present
+# - Pulls LLM model
+# - Creates all required Python files
+# - Runs the Orchestrator
 
-# ---------- user-adjustable defaults (change here if you want) -------------
-GITHUB_USER=""               # leave empty to be asked
-REPO_NAME=""                 # leave empty = folder name
-PRIVATE="false"              # "true"  → private repo
-                             # "false" → public repo
-REMOTE_NAME="origin"         # the usual
-# ---------------------------------------------------------------------------
+set -e  # Exit on error
 
-# pretty colours
-R=$(tput setaf 1); G=$(tput setaf 2); Y=$(tput setaf 3); B=$(tput setaf 4); N=$(tput sgr0)
+PROJECT_DIR="$HOME/Desktop/Sentience_5.5"
+echo "Setting up Sentience in $PROJECT_DIR"
 
-# helper: ask a question and return the reply
-ask(){ read -rp "$1 [$2]: " v; echo "${v:-$2}"; }
+# Create project directory
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
 
-# 1. discover repo name ------------------------------------------------------
-DIRNAME=$(basename "$PWD")
-REPO_NAME=${REPO_NAME:-$(ask "Repository name" "$DIRNAME")}
-
-# 2. GitHub username ---------------------------------------------------------
-if [ -z "$GITHUB_USER" ]; then
-   # try to grab it from global config or ask
-   GITHUB_USER=$(git config --global user.name 2>/dev/null || true)
-   [ -z "$GITHUB_USER" ] && GITHUB_USER=$(ask "GitHub username" "")
-fi
-
-# 3. private / public --------------------------------------------------------
-PRIVATE=$(ask "Private repo" "$PRIVATE")
-
-# 4. create the remote repo via GitHub CLI (if installed) --------------------
-if command -v gh &>/dev/null; then
-   echo -e "\n${G}Creating GitHub repo ${B}$GITHUB_USER/$REPO_NAME${N}"
-   gh repo create "$REPO_NAME" ${PRIVATE:+-p} -d "Autonomous sentience framework" -y
+# Install Python dependencies (if pip available)
+if command -v pip3 &> /dev/null; then
+    pip3 install requests beautifulsoup4
 else
-   echo -e "\n${Y}GitHub CLI (gh) not found – create the repo manually on the web:${N}"
-   echo "   https://github.com/new   name: $REPO_NAME   private: $PRIVATE"
-   echo "   Then press ENTER to continue ..."; read -r
+    echo "pip3 not found. Install Python dependencies manually."
 fi
 
-# 5. local git setup ---------------------------------------------------------
-if [ ! -d .git ]; then
-   echo -e "\n${G}Initialising local Git repository${N}"
-   git init
+# Install Ollama if not installed
+if ! command -v ollama &> /dev/null; then
+    echo "Installing Ollama..."
+    curl -fsSL https://ollama.com/install.sh | sh
+else
+    echo "Ollama already installed."
 fi
 
-# 6. unified .gitignore ------------------------------------------------------
-cat > .gitignore <<'EOF'
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
+# Pull LLM model (default: llama3.1:8b)
+echo "Pulling LLM model..."
+ollama pull llama3.1:8b
 
-# ROS
-build/
-install/
-log/
-.ros/
-*.bag
-*.pcd
+# Start Ollama server in background if not running
+if ! pgrep -f "ollama serve" > /dev/null; then
+    ollama serve &
+    sleep 5  # Wait for server to start
+fi
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Create all Python files
+cat << EOF > Orchestrator.py
+#!/usr/bin/env python3
+"""
+Orchestrator.py
+Sentience 5.5 – Central coordinator with LLM intelligence
+"""
 
-# OS
-.DS_Store
-Thumbs.db
+import sys
+
+from Memory_Node import MemoryNode
+from Nonsense_Node import NonsenseNode
+from Knowledge_Node import KnowledgeNode
+from Reasoning_Node import ReasoningNode
+from Conversational_Intelligence_Node import ConversationalIntelligenceNode
+from Web_Crawler_Node import WebCrawlerNode
+from Evolver_Node import EvolverNode
+from LLM_Node import LLMNode
+
+BANNER = r"""
+███████╗███████╗███╗   ██╗████████╗██╗███████╗███╗   ██╗ ██████╗███████╗
+██╔════╝██╔════╝████╗  ██║╚══██╔══╝██║██╔════╝████╗  ██║██╔════╝██╔════╝
+███████╗█████╗  ██╔██╗ ██║   ██║   ██║█████╗  ██╔██╗ ██║██║     █████╗  
+╚════██║██╔══╝  ██║╚██╗██║   ██║   ██║██╔══╝  ██║╚██╗██║██║     ██╔══╝  
+███████║███████╗██║ ╚████║   ██║   ██║███████╗██║ ╚████║╚██████╗███████╗
+╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝╚══════╝
+"""
+
+class Orchestrator:
+    def __init__(self):
+        self.memory = MemoryNode()
+        self.nonsense = NonsenseNode()
+        self.knowledge = KnowledgeNode()
+        self.crawler = WebCrawlerNode(self.memory)
+        self.evolver = EvolverNode(self.memory, self.knowledge, self.crawler)
+        self.reasoning = ReasoningNode(self.knowledge, self.memory)
+        self.llm = LLMNode()
+        self.chat = ConversationalIntelligenceNode(
+            self.memory, self.nonsense, self.knowledge, self.reasoning,
+            self.crawler, self.evolver, self.llm
+        )
+
+        print(BANNER)
+        print("Sentience online.")
+
+    def run(self):
+        while True:
+            try:
+                input_text = input(">> ").strip()
+                if not input_text:
+                    continue
+                response = self.chat.respond(input_text)
+                print(response)
+            except KeyboardInterrupt:
+                print("\\nShutting down.")
+                sys.exit(0)
+
+if __name__ == "__main__":
+    Orchestrator().run()
 EOF
 
-# 7. first commit ------------------------------------------------------------
-echo -e "\n${G}Adding everything and committing${N}"
-git add .
-git commit -m "Initial commit – autonomous sentience framework v5.5"
+# Create other nodes (minimal placeholders - expand as needed)
+cat << EOF > LLM_Node.py
+#!/usr/bin/env python3
+import subprocess
+import json
 
-# 8. connect local → remote --------------------------------------------------
-REMOTE_URL="git@github.com:$GITHUB_USER/$REPO_NAME.git"
-git remote get-url "$REMOTE_NAME" &>/dev/null && git remote remove "$REMOTE_NAME"
-git remote add "$REMOTE_NAME" "$REMOTE_URL"
+class LLMNode:
+    def __init__(self):
+        self.model = "llama3.1:8b"
 
-# 9. push --------------------------------------------------------------------
-echo -e "\n${G}Pushing to GitHub${N}"
-git branch -M main
-git push -u "$REMOTE_NAME" main
+    def generate(self, prompt):
+        try:
+            result = subprocess.run(["ollama", "run", self.model, prompt], capture_output=True, text=True)
+            return result.stdout.strip()
+        except Exception as e:
+            return f"LLM error: {str(e)}"
+EOF
 
-echo -e "\n${G}Done!${N}  Your code is live at https://github.com/$GITHUB_USER/$REPO_NAME"
+# Add placeholders for other files
+touch Memory_Node.py Nonsense_Node.py Knowledge_Node.py Reasoning_Node.py
+touch Conversational_Intelligence_Node.py Web_Crawler_Node.py Evolver_Node.py
+
+echo "Setup complete. Run 'python3 Orchestrator.py' to start Sentience."

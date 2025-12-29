@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-InsightNode – ROS-free, asyncio-first
+InsightNode – Evolver-integrated, learning-enabled
 Generates node suggestions from awareness + conversation + dreaming
+Now instrumented for Evolver.py (Sentience 5.5)
 """
 from __future__ import annotations
 
@@ -10,9 +11,11 @@ import asyncio
 import json
 import logging
 import sys
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, List
 
 import aiohttp
 from aiohttp import web
@@ -28,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("Insight-Node")
 
 # --------------------------------------------------------------------------- #
-# Protocols (for type-safe mocking or ROS bridging)                          #
+# Protocols (stable contracts)                                                #
 # --------------------------------------------------------------------------- #
 class AwarenessProvider(Protocol):
     def get_state_description(self) -> str: ...
@@ -42,13 +45,32 @@ class DreamingProvider(Protocol):
 class LLMProvider(Protocol):
     async def query(self, prompt: str) -> str: ...
 
+class EvolverHook(Protocol):
+    def record(self, payload: Dict[str, Any]) -> None: ...
+
+# --------------------------------------------------------------------------- #
+# Evolver telemetry                                                           #
+# --------------------------------------------------------------------------- #
+@dataclass
+class InsightTelemetry:
+    node: str = "InsightNode"
+    event_id: str = ""
+    timestamp: float = 0.0
+    context_size: int = 0
+    llm_latency_ms: float = 0.0
+    suggestions_count: int = 0
+    json_valid: bool = False
+    error: Optional[str] = None
+
 # --------------------------------------------------------------------------- #
 # InsightNode                                                                 #
 # --------------------------------------------------------------------------- #
 class InsightNode:
     """
-    ROS-free insight engine.
-    Same public API as original.
+    Evolver-compatible Insight Node.
+    - Learning aware
+    - Telemetry emitting
+    - Deterministic API surface
     """
 
     def __init__(
@@ -57,19 +79,22 @@ class InsightNode:
         conversation: ConversationProvider,
         dreaming: DreamingProvider,
         llm: LLMProvider,
+        evolver: Optional[EvolverHook] = None,
     ):
         self.awareness = awareness
         self.conversation = conversation
         self.dreaming = dreaming
         self.llm = llm
+        self.evolver = evolver
 
     # ------------------------------------------------------------------ #
-    # Public API (unchanged signatures)                                  #
+    # Context + prompt                                                   #
     # ------------------------------------------------------------------ #
     def gather_context(self) -> str:
         awareness_text = self.awareness.get_state_description()
         conversation_text = self.conversation.get_recent_dialogue()
         dreaming_text = self.dreaming.get_recent_dream()
+
         return (
             f"Robot Awareness:\n{awareness_text}\n\n"
             f"Recent Conversation:\n{conversation_text}\n\n"
@@ -78,30 +103,61 @@ class InsightNode:
 
     def construct_prompt(self, context: str) -> str:
         return (
-            f"Given the robot's current situation and context below:\n{context}\n\n"
-            "Identify areas where the robot can improve itself by creating new functional nodes. "
-            "For each suggested node, provide a name and a short description. "
-            "Return the response in valid JSON format as:\n"
-            "{\n  \"nodes\": [\n    {\"name\": \"NodeName\", \"spec\": \"Description\"}, ... ]\n}\n"
+            "You are an architectural insight engine.\n"
+            "Your task is to identify missing or weak cognitive functions.\n\n"
+            f"Context:\n{context}\n\n"
+            "Propose new functional nodes that would improve the system.\n"
+            "Each node must be specific, non-duplicative, and purposeful.\n\n"
+            "Return JSON only in this format:\n"
+            "{\n"
+            "  \"nodes\": [\n"
+            "    {\n"
+            "      \"name\": \"NodeName\",\n"
+            "      \"spec\": \"Clear functional responsibility\"\n"
+            "    }\n"
+            "  ]\n"
+            "}"
         )
 
+    # ------------------------------------------------------------------ #
+    # Core analysis                                                      #
+    # ------------------------------------------------------------------ #
     async def analyze(self) -> Dict[str, Any]:
+        telemetry = InsightTelemetry(
+            event_id=str(uuid.uuid4()),
+            timestamp=time.time(),
+        )
+
         context = self.gather_context()
+        telemetry.context_size = len(context)
+
         prompt = self.construct_prompt(context)
+
+        start = time.perf_counter()
         raw_response = await self.llm.query(prompt)
+        telemetry.llm_latency_ms = (time.perf_counter() - start) * 1000.0
+
         try:
-            suggestions = json.loads(raw_response)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("LLM response not valid JSON – returning empty")
-            suggestions = {"nodes": []}
-        return suggestions
+            parsed = json.loads(raw_response)
+            telemetry.json_valid = True
+            telemetry.suggestions_count = len(parsed.get("nodes", []))
+        except Exception as e:
+            parsed = {"nodes": []}
+            telemetry.error = str(e)
+            logger.warning("InsightNode: invalid JSON from LLM")
+
+        # Emit to evolver
+        if self.evolver:
+            self.evolver.record(asdict(telemetry))
+
+        return parsed
 
     # ------------------------------------------------------------------ #
-    # HTTP service (optional)                                            #
+    # HTTP interface                                                     #
     # ------------------------------------------------------------------ #
     async def _http_analyze(self, request: web.Request) -> web.Response:
-        suggestions = await self.analyze()
-        return web.json_response(suggestions)
+        result = await self.analyze()
+        return web.json_response(result)
 
     def build_app(self) -> web.Application:
         app = web.Application()
@@ -110,65 +166,72 @@ class InsightNode:
 
 
 # --------------------------------------------------------------------------- #
-# Stand-alone LLM adapters                                                    #
+# Evolver-compatible stubs                                                    #
+# --------------------------------------------------------------------------- #
+class StdoutEvolver:
+    """Drop-in Evolver hook (replace with evolver.py collector)."""
+    def record(self, payload: Dict[str, Any]) -> None:
+        logger.info("EVOLVER_EVENT %s", json.dumps(payload))
+
+
+# --------------------------------------------------------------------------- #
+# Mock providers                                                              #
 # --------------------------------------------------------------------------- #
 class MockLLM:
-    """Synchronous mock – wrap for async usage."""
-
     async def query(self, prompt: str) -> str:
-        logger.debug("LLM prompt:\n%s", prompt)
-        await asyncio.sleep(0.1)  # simulate network
+        await asyncio.sleep(0.1)
         return json.dumps(
             {
                 "nodes": [
-                    {"name": "EnergyManagerNode", "spec": "Manage battery usage efficiently."},
-                    {"name": "TaskSchedulerNode", "spec": "Optimise task order to meet deadlines."},
+                    {
+                        "name": "CognitiveLoadBalancerNode",
+                        "spec": "Redistributes reasoning effort across nodes to prevent saturation."
+                    },
+                    {
+                        "name": "SelfCritiqueNode",
+                        "spec": "Evaluates internal outputs for blind spots and contradictions."
+                    }
                 ]
             }
         )
 
 
-# --------------------------------------------------------------------------- #
-# Mock providers (identical to original)                                      #
-# --------------------------------------------------------------------------- #
 class MockAwareness:
     def get_state_description(self) -> str:
-        return "Battery drains too quickly and task scheduling is inefficient."
-
+        return "System frequently revisits the same conclusions."
 
 class MockConversation:
     def get_recent_dialogue(self) -> str:
-        return "User mentioned that tasks are often late and system overheats."
-
+        return "User says responses feel repetitive."
 
 class MockDreaming:
     def get_recent_dream(self) -> str:
-        return "Imagined a node balancing power usage dynamically."
+        return "A structure that notices its own loops and corrects them."
 
 
 # --------------------------------------------------------------------------- #
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Sentience 5.0 – InsightNode (ROS-free)")
-    p.add_argument("--serve", action="store_true", help="run HTTP service")
-    p.add_argument("--port", type=int, default=8084, help="HTTP port")
+    p = argparse.ArgumentParser(description="Sentience 5.5 – InsightNode")
+    p.add_argument("--serve", action="store_true")
+    p.add_argument("--port", type=int, default=8084)
     return p
 
 
 # --------------------------------------------------------------------------- #
- Entry-point                                                               #
+# Entry point                                                                 #
 # --------------------------------------------------------------------------- #
 async def amain() -> None:
     args = build_parser().parse_args()
 
-    # wire mocks – replace with real providers via CLI or env vars later
-    awareness = MockAwareness()
-    conversation = MockConversation()
-    dreaming = MockDreaming()
-    llm = MockLLM()
-
-    node = InsightNode(awareness, conversation, dreaming, llm)
+    node = InsightNode(
+        awareness=MockAwareness(),
+        conversation=MockConversation(),
+        dreaming=MockDreaming(),
+        llm=MockLLM(),
+        evolver=StdoutEvolver(),
+    )
 
     if args.serve:
         app = node.build_app()
@@ -176,13 +239,11 @@ async def amain() -> None:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", args.port)
         await site.start()
-        logger.info("Insight HTTP service on :%d", args.port)
-        await asyncio.Event().wait()  # forever
+        logger.info("InsightNode HTTP service running on :%d", args.port)
+        await asyncio.Event().wait()
     else:
-        suggestions = await node.analyze()
-        print("InsightNode Suggestions:")
-        for n in suggestions.get("nodes", []):
-            print(f"- {n['name']}: {n['spec']}")
+        result = await node.analyze()
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

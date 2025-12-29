@@ -1,30 +1,39 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
+*.pyc
+
+# Virtual env
 venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
 
-# ROS
-build/
-install/
-log/
-.ros/
-*.bag
-*.pcd
+# Databases / state
+*.db
+*.sqlite
+*.json
+memory/
+memory_log.json
+memory_store.json
+long_term_memory.json
+sensory_log.db
+market_qualia.db
+sentience_memory.db
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Logs / outputs
+*.log
+output.txt
+crawl_log.txt
+orchestrator.log
+
+# Binaries / cache
+*.bin
+Ryzen_System_Cache_v402.bin
+
+# Backups
+evolution_backups/
 
 # OS
 .DS_Store
-Thumbs.db
+
+# Runtime / experiment artifacts
+sentience_env/
+alchemical_log.txt
+wealth_simulation.txt

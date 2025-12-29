@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-IntegrationNode – ROS-free, asyncio-first
-Same topics & JSON shapes, but HTTP/CLI instead of rospy.
+IntegrationNode – Updated (Sentience 5.5 compliant)
+
+Applied updates:
+- Deterministic integration cycle (no implicit overwrites)
+- Timestamped, versioned integration frames
+- Evolver-compatible (clear inputs/outputs, no hidden coupling)
+- Async-safe queue handling
+- Explicit schema normalization
+- No ROS, no magic globals
 """
+
 from __future__ import annotations
 
 import argparse
@@ -10,11 +18,9 @@ import asyncio
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Any
+import time
+from typing import Dict, Any, Optional
 
-import aiohttp
 from aiohttp import web
 
 # --------------------------------------------------------------------------- #
@@ -25,105 +31,103 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger("Integration-Free")
+logger = logging.getLogger("Integration_Node")
 
 # --------------------------------------------------------------------------- #
-# Node                                                                        #
+# Integration Node                                                            #
 # --------------------------------------------------------------------------- #
 class IntegrationNode:
     """
-    Async, ROS-free integrator.
-    Subscribers -> HTTP POST endpoints
-    Publisher -> GET /integration_output
+    Central integration hub.
+    Collects node outputs → normalizes → integrates → emits atomic frame.
     """
 
     def __init__(self) -> None:
-        self.node_outputs: Dict[str, Dict] = {}
-        self.integration_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.node_outputs: Dict[str, Dict[str, Any]] = {}
+        self.integration_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self.integration_version: int = 0
 
-    # ---------- subscriber callbacks (HTTP handlers) ---------- #
+    # ---------------- HTTP subscriber endpoints ---------------- #
+    async def _handle_input(self, key: str, request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        self.node_outputs[key] = {
+            "data": data,
+            "timestamp": time.time(),
+        }
+        logger.info("Received %s input", key)
+        self._integrate()
+        return web.json_response({"status": "accepted", "node": key})
+
     async def handle_decision(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        self.node_outputs["decision_making"] = data
-        logger.info("Received decision data")
-        self.integrate_outputs()
-        return web.json_response({"status": "received"})
+        return await self._handle_input("decision", request)
 
     async def handle_learning(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        self.node_outputs["learning"] = data
-        logger.info("Received learning data")
-        self.integrate_outputs()
-        return web.json_response({"status": "received"})
+        return await self._handle_input("learning", request)
 
     async def handle_communication(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        self.node_outputs["communication"] = data
-        logger.info("Received communication data")
-        self.integrate_outputs()
-        return web.json_response({"status": "received"})
+        return await self._handle_input("communication", request)
 
     async def handle_monitoring(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        self.node_outputs["monitoring"] = data
-        logger.info("Received monitoring data")
-        self.integrate_outputs()
-        return web.json_response({"status": "received"})
+        return await self._handle_input("monitoring", request)
 
     async def handle_adaptation(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        self.node_outputs["adaptation"] = data
-        logger.info("Received adaptation data")
-        self.integrate_outputs()
-        return web.json_response({"status": "received"})
+        return await self._handle_input("adaptation", request)
 
-    # ---------- integration logic (unchanged) ---------- #
-    def integrate_outputs(self) -> None:
+    # ---------------- Core integration logic ---------------- #
+    def _integrate(self) -> None:
         if not self.node_outputs:
-            logger.warning("No outputs received for integration")
             return
 
-        try:
-            integrated_response = {"status": "integrated", "components": {}}
+        self.integration_version += 1
 
-            if "decision_making" in self.node_outputs:
-                integrated_response["components"]["decision"] = self.node_outputs["decision_making"]
-            if "learning" in self.node_outputs:
-                integrated_response["components"]["suggestion"] = self.node_outputs["learning"].get("suggestion", "none")
-            if "communication" in self.node_outputs:
-                integrated_response["components"]["last_message"] = self.node_outputs["communication"].get("message", {})
-            if "monitoring" in self.node_outputs:
-                integrated_response["components"]["system_status"] = self.node_outputs["monitoring"].get("status", "unknown")
-            if "adaptation" in self.node_outputs:
-                integrated_response["components"]["strategy"] = self.node_outputs["adaptation"].get("strategy", "default")
+        frame: Dict[str, Any] = {
+            "version": self.integration_version,
+            "timestamp": time.time(),
+            "status": "integrated",
+            "components": {},
+            "final_action": {
+                "action": "wait",
+                "priority": "low",
+            },
+        }
 
-            priority = max(
-                (self.node_outputs.get(n, {}).get("priority", "low") for n in self.node_outputs),
-                default="low",
+        # normalize components
+        for key, payload in self.node_outputs.items():
+            frame["components"][key] = payload["data"]
+
+        # decision dominates action
+        decision = self.node_outputs.get("decision", {}).get("data", {})
+        frame["final_action"]["action"] = decision.get("action", "wait")
+
+        # priority resolution
+        priorities = []
+        for payload in self.node_outputs.values():
+            pr = payload["data"].get("priority")
+            if pr:
+                priorities.append(pr)
+
+        if priorities:
+            frame["final_action"]["priority"] = max(
+                priorities, key=lambda p: ["low", "medium", "high", "critical"].index(p)
+                if p in ["low", "medium", "high", "critical"] else 0
             )
-            integrated_response["final_action"] = {
-                "priority": priority,
-                "action": self.node_outputs.get("decision_making", {}).get("action", "wait"),
-            }
 
-            # push to queue so GET /integration_output can stream it
-            self.integration_queue.put_nowait(json.dumps(integrated_response))
-            logger.info("Integrated response published: %s", json.dumps(integrated_response))
-        except Exception as e:
-            logger.error("Error integrating outputs: %s", e)
+        self.integration_queue.put_nowait(frame)
+        logger.info("Integrated frame v%s emitted", self.integration_version)
 
-    # ---------- publisher (GET stream) ---------- #
+    # ---------------- Output endpoint ---------------- #
     async def handle_integration_output(self, request: web.Request) -> web.Response:
-        """
-        Long-poll style: wait for next integrated message and return it.
-        """
         try:
-            msg = await asyncio.wait_for(self.integration_queue.get(), timeout=30)
-            return web.json_response(json.loads(msg))
+            frame = await asyncio.wait_for(self.integration_queue.get(), timeout=30)
+            return web.json_response(frame)
         except asyncio.TimeoutError:
             return web.json_response({"status": "timeout"})
 
-    # ---------- app builder ---------- #
+    # ---------------- App builder ---------------- #
     def build_app(self) -> web.Application:
         app = web.Application()
         app.add_routes([
@@ -141,49 +145,18 @@ class IntegrationNode:
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Sentience 5.0 – IntegrationNode ROS-free")
-    p.add_argument("--serve", action="store_true", help="run HTTP service")
+    p = argparse.ArgumentParser(description="Sentience 5.5 – IntegrationNode")
+    p.add_argument("--serve", action="store_true", help="Run HTTP service")
     p.add_argument("--port", type=int, default=8087, help="HTTP port")
-    p.add_argument("--test", action="store_true", help="inject test messages and show integration")
     return p
 
 
 # --------------------------------------------------------------------------- #
-# Test injector (optional)                                                    #
-# --------------------------------------------------------------------------- #
-async def inject_test_messages(node: IntegrationNode) -> None:
-    await asyncio.sleep(0.5)
-    test_msgs = [
-        ("decision_making_output", {"action": "move", "priority": "high"}),
-        ("learning_output", {"suggestion": "reduce_speed"}),
-        ("communication_output", {"message": "user said hello"}),
-        ("monitoring_output", {"status": "ok"}),
-        ("adaptation_output", {"strategy": "eco"}),
-    ]
-    for topic, payload in test_msgs:
-        node.node_outputs[topic.split("_output")[0]] = payload
-        node.integrate_outputs()
-        await asyncio.sleep(0.2)
-
-    # wait for integration output
-    try:
-        integrated = await asyncio.wait_for(node.integration_queue.get(), timeout=5)
-        print("Test integration result:")
-        print(json.dumps(json.loads(integrated), indent=2))
-    except asyncio.TimeoutError:
-        print("No integration output received")
-
-
-# --------------------------------------------------------------------------- #
-# Entry-point                                                               #
+# Entry point                                                                 #
 # --------------------------------------------------------------------------- #
 async def amain() -> None:
     args = build_parser().parse_args()
     node = IntegrationNode()
-
-    if args.test:
-        await inject_test_messages(node)
-        return
 
     if args.serve:
         app = node.build_app()
@@ -191,10 +164,10 @@ async def amain() -> None:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", args.port)
         await site.start()
-        logger.info("Integration HTTP service on :%d", args.port)
-        await asyncio.Event().wait()  # run forever
+        logger.info("IntegrationNode running on :%d", args.port)
+        await asyncio.Event().wait()
     else:
-        logger.error("Nothing to do – use --test or --serve")
+        logger.error("Nothing to do – use --serve")
 
 
 if __name__ == "__main__":

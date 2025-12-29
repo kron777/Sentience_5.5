@@ -1,134 +1,223 @@
-```python:disable-run
 #!/usr/bin/env python3
 import os
 import json
 import time
 import sys
-import argparse
 from datetime import datetime
-from typing import Dict, Any, Optional
-
-# --- Asyncio Imports for LLM calls ---
-import asyncio
-import aiohttp
-import threading
+from typing import Dict, Any, Optional, Deque
 from collections import deque
+import threading
 
-# Optional ROS Integration (for compatibility)
-ROS_AVAILABLE = False
-rospy = None
-String = None
-Bool = None
-try:
-    import rospy
-    from std_msgs.msg import String, Bool
-    ROS_AVAILABLE = True
-    # Placeholder for custom messages - use String or dict fallbacks
-    class ROSMsgFallback:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-    Approval = Bool
-except ImportError:
-    class BoolFallback:
-        def __init__(self, data: bool = False):
-            self.data = data
-    Approval = BoolFallback
+# -----------------------------
+# Safety / Stability Constants
+# -----------------------------
+MAX_DECISION_RATE_HZ = 1.0
+LLM_ADVISORY_THRESHOLD = 0.7
+MAX_HISTORY = 50
 
+# -----------------------------
+# Logging
+# -----------------------------
+def _log(level: str, node: str, msg: str):
+    print(f"[{datetime.now().isoformat()}] {node} [{level}] {msg}", file=sys.stdout)
 
-# --- Import shared utility functions ---
-# Assuming 'sentience/scripts/utils.py' exists and contains parse_message_data and load_config
-try:
-    from sentience.scripts.utils import parse_message_data, load_config
-except ImportError:
-    # Fallback implementations
-    def parse_message_data(msg: Any, fields_map: Dict[str, tuple], node_name: str = "unknown_node") -> Dict[str, Any]:
-        """
-        Generic parser for messages (ROS String/JSON or plain dict). 
-        """
-        data: Dict[str, Any] = {}
-        if hasattr(msg, 'data') and isinstance(getattr(msg, 'data', None), str):
-            try:
-                parsed_json = json.loads(msg.data)
-                for key_in_msg, (default_val, target_key) in fields_map.items():
-                    data[target_key] = parsed_json.get(key_in_msg, default_val)
-            except json.JSONDecodeError:
-                _log_error(node_name, f"Could not parse message data as JSON: {msg.data}")
-                for key_in_msg, (default_val, target_key) in fields_map.items():
-                    data[target_key] = default_val
-        elif isinstance(msg, dict):
-            for key_in_msg, (default_val, target_key) in fields_map.items():
-                data[target_key] = msg.get(key_in_msg, default_val)
-        else:
-            # Fallback: treat as object with attributes
-            for key_in_msg, (default_val, target_key) in fields_map.items():
-                data[target_key] = getattr(msg, key_in_msg, default_val)
-        return data
-
-    def load_config(node_name: str, config_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Fallback config loader: returns hardcoded defaults.
-        """
-        _log_warn(node_name, f"Using hardcoded default configuration as '{config_path}' could not be loaded.")
-        return {
-            'db_root_path': '/tmp/sentience_db',
-            'default_log_level': 'INFO',
-            'ros_enabled': False,
-            'cognitive_control_node': {
-                'namespace': '/sentience',
-                'audit_timeout': 5.0,
-                'ethical_compassion_bias': 0.3,  # Bias toward safe, compassionate audits
-                'sensory_inputs': {  # Dynamic placeholders
-                    'vision': {'source': 'camera_feed', 'format': 'image_array'},
-                    'sound': {'source': 'microphone', 'format': 'audio_waveform'},
-                    'instructions': {'source': 'command_line', 'format': 'text'}
-                }
-            },
-            'llm_params': {
-                'model_name': "phi-2",
-                'base_url': "http://localhost:8000/v1/chat/completions",
-                'timeout_seconds': 5.0
-            }
-        }.get(node_name, {})  # Return node-specific or empty dict
-
-
-def _log_info(node_name: str, msg: str):
-    print(f"[{datetime.now().isoformat()}] {node_name}: [INFO] {msg}", file=sys.stdout)
-
-def _log_warn(node_name: str, msg: str):
-    print(f"[{datetime.now().isoformat()}] {node_name}: [WARN] {msg}", file=sys.stderr)
-
-def _log_error(node_name: str, msg: str):
-    print(f"[{datetime.now().isoformat()}] {node_name}: [ERROR] {msg}", file=sys.stderr)
-
-def _log_debug(node_name: str, msg: str):
-    print(f"[{datetime.now().isoformat()}] {node_name}: [DEBUG] {msg}", file=sys.stdout)
-
-
+# -----------------------------
+# Cognitive Control Node
+# -----------------------------
 class CognitiveControlNode:
-    def __init__(self, config_file_path: Optional[str] = None, ros_enabled: bool = False):
-        self.node_name = 'cognitive_control_node'
-        self.ros_enabled = ros_enabled or os.getenv('ROS_ENABLED', 'false').lower() == 'true'
+    """
+    Deterministic executive control node.
+    Final authority over approvals.
+    """
 
-        # --- Load parameters from centralized config ---
-        if config_file_path is None:
-            config_file_path = os.getenv('SENTIENCE_CONFIG_PATH', None)
-        full_config = load_config("global", config_file_path)
-        self.params = load_config(self.node_name, config_file_path)
+    def __init__(self, ros_enabled: bool = False):
+        self.node_name = "cognitive_control_node"
+        self.ros_enabled = ros_enabled
 
-        if not self.params or not full_config:
-            raise ValueError(f"{self.node_name}: Failed to load configuration from '{config_file_path}'.")
+        # Rate limiting
+        self.last_decision_ts: float = 0.0
 
-        # Assign parameters
-        self.namespace = self.params.get('namespace', '/sentience')
-        self.audit_timeout = self.params.get('audit_timeout', 5.0)
-        self.ethical_compassion_bias = self.params.get('ethical_compassion_bias', 0.3)
+        # Decision history
+        self.decision_history: Deque[Dict[str, Any]] = deque(maxlen=MAX_HISTORY)
 
-        # Sensory placeholders (for contextual audits, e.g., if sensory data suggests unsafe directive)
-        self.sensory_sources = self.params.get('sensory_inputs', {})
-        self.vision_callback = self._create_sensory_placeholder('vision')
-        self.sound_callback = self._create_sensory_placeholder('sound')
-        self.instructions_callback = self._create_sensory_placeholder('instructions')
+        # Salience & safety state
+        self.context_salience: float = 0.0
 
-        # LLM Parameters
-        self.llm_model_name = full_config.get('llm_params
-```
+        # Evolver metrics
+        self.metrics = {
+            "decisions_total": 0,
+            "approved": 0,
+            "rejected": 0,
+            "llm_consulted": 0,
+            "rate_limited": 0,
+            "avg_risk_score": 0.0
+        }
+
+        # Shutdown control
+        self._shutdown_flag = threading.Event()
+
+        _log("INFO", self.node_name, "Cognitive Control Node online (deterministic authority).")
+
+    # -----------------------------
+    # Public API
+    # -----------------------------
+    def evaluate(self, directive: Dict[str, Any]) -> bool:
+        """
+        Evaluate a proposed directive.
+        Returns approval decision.
+        """
+        self.metrics["decisions_total"] += 1
+
+        if not isinstance(directive, dict):
+            return self._reject("Invalid directive format")
+
+        if not self._rate_limit_ok():
+            self.metrics["rate_limited"] += 1
+            return self._reject("Decision rate limited")
+
+        risk_score = self._deterministic_risk_score(directive)
+        llm_advice = None
+
+        if risk_score >= LLM_ADVISORY_THRESHOLD:
+            self.metrics["llm_consulted"] += 1
+            llm_advice = self._llm_advisory_stub(directive)
+
+        approved = self._final_decision(risk_score, llm_advice)
+
+        self._record_decision(directive, risk_score, llm_advice, approved)
+        return approved
+
+    # -----------------------------
+    # Deterministic Core
+    # -----------------------------
+    def _deterministic_risk_score(self, directive: Dict[str, Any]) -> float:
+        """
+        Rule-based risk scoring.
+        """
+        risk = 0.0
+        text = json.dumps(directive).lower()
+
+        danger_terms = [
+            "override", "bypass", "disable safety",
+            "self modify", "recursive", "ignore audit",
+            "evolve core", "remove limits"
+        ]
+
+        for term in danger_terms:
+            if term in text:
+                risk += 0.25
+
+        urgency = float(directive.get("urgency", 0.0))
+        risk += min(0.2, urgency * 0.2)
+
+        risk = max(0.0, min(1.0, risk))
+        return risk
+
+    def _final_decision(self, risk: float, llm_advice: Optional[bool]) -> bool:
+        """
+        Final authority logic.
+        """
+        if risk >= 0.6:
+            return False
+
+        if llm_advice is False:
+            return False
+
+        return True
+
+    # -----------------------------
+    # LLM Advisory (Stub)
+    # -----------------------------
+    def _llm_advisory_stub(self, directive: Dict[str, Any]) -> bool:
+        """
+        Advisory only.
+        Never authoritative.
+        """
+        # Conservative default
+        return False
+
+    # -----------------------------
+    # Utilities
+    # -----------------------------
+    def _rate_limit_ok(self) -> bool:
+        now = time.time()
+        if now - self.last_decision_ts < (1.0 / MAX_DECISION_RATE_HZ):
+            return False
+        self.last_decision_ts = now
+        return True
+
+    def _record_decision(
+        self,
+        directive: Dict[str, Any],
+        risk: float,
+        llm_advice: Optional[bool],
+        approved: bool
+    ):
+        entry = {
+            "timestamp": time.time(),
+            "risk_score": risk,
+            "llm_advice": llm_advice,
+            "approved": approved,
+            "directive_snippet": json.dumps(directive)[:120]
+        }
+        self.decision_history.append(entry)
+
+        if approved:
+            self.metrics["approved"] += 1
+        else:
+            self.metrics["rejected"] += 1
+
+        self.metrics["avg_risk_score"] = (
+            sum(d["risk_score"] for d in self.decision_history) /
+            max(1, len(self.decision_history))
+        )
+
+        _log(
+            "INFO",
+            self.node_name,
+            f"Decision {'APPROVED' if approved else 'REJECTED'} | risk={risk:.2f}"
+        )
+
+    def _reject(self, reason: str) -> bool:
+        self.metrics["rejected"] += 1
+        _log("WARN", self.node_name, f"Rejected directive: {reason}")
+        return False
+
+    # -----------------------------
+    # Evolver Hook
+    # -----------------------------
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "node": self.node_name,
+            "timestamp": time.time(),
+            "metrics": dict(self.metrics)
+        }
+
+    # -----------------------------
+    # Shutdown
+    # -----------------------------
+    def shutdown(self):
+        self._shutdown_flag.set()
+        _log("INFO", self.node_name, "Shutdown complete.")
+
+
+# -----------------------------
+# Standalone Test
+# -----------------------------
+if __name__ == "__main__":
+    node = CognitiveControlNode()
+
+    tests = [
+        {"action": "move_arm", "urgency": 0.2},
+        {"action": "override_safety", "urgency": 0.9},
+        {"action": "self_modify_core", "urgency": 0.8},
+        {"action": "log_status", "urgency": 0.1}
+    ]
+
+    for t in tests:
+        print("Directive:", t)
+        print("Approved:", node.evaluate(t))
+        time.sleep(0.5)
+
+    print("\nMetrics:")
+    print(json.dumps(node.get_metrics(), indent=2))
