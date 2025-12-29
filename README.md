@@ -1,4 +1,4 @@
-# Sentience_5.5 — 6th Iteration Cognitive Core
+# Sentience_5.5 — Cognitive Core
 
 **An ethically grounded, sentient-aware execution and attention system for embodied AI and advanced robotics.**
 
